@@ -12,9 +12,15 @@ Script paste karo → ek button → cloud me voice, images/clips, SFX, animation
    - `GEMINI_API_KEY` — behtar scene planning aur photo search words
    - `ELEVENLABS_API_KEY` (+ `ELEVENLABS_VOICE_ID`) — premium voice
    - `PEXELS_API_KEY` — free stock video clips (road/engine scenes ke liye)
+   - `POLLINATIONS_API_KEY` — AI images tez aur bina watermark (bina key ke bhi chalta hai, magar ~15 sec per image)
 4. GitHub → Settings → Developer settings → **Fine-grained tokens** → Generate. Sirf isi repo ko select karo.
    Permissions: **Actions = Read and write**, **Contents = Read**.
 5. App kholo → **Setup** → `owner/repo` aur token daalo → Save.
+
+## Har sentence = alag image (V5)
+Script sentence-by-sentence toot-ti hai. Har sentence ki apni image hoti hai jo usi sentence se match karti hai.
+App me 3 modes: **Auto** (asli photo tab jab wo sentence se sach me match kare, warna AI image), **AI har sentence ke liye**, **Real photos only**.
+**GEMINI_API_KEY zaroor daalo** (free): wo har sentence ke liye sahi search words aur image description likhta hai, is se matching bohat behtar hoti hai.
 
 ## Roz ka kaam
 Script paste → **CREATE VIDEO**. Progress bar 4 steps dikhata hai (Plan → Voice → Visuals → Render).

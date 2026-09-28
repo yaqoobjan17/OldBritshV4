@@ -1,24 +1,22 @@
 #!/usr/bin/env python3
 """Old British Cars - one-click pipeline: script -> 1080p MP4.
 
+One scene per SENTENCE. Every sentence gets its own picture that must match it.
 Stages (each reads/writes work/state.json):
-  plan    split script into scenes (Gemini if key, else built-in splitter)
-  voice   narration per scene (ElevenLabs if key, else free Edge-TTS British voice)
-  visuals photos/clips per scene (Wikimedia Commons + Pexels, fallback cards)
+  plan    split script into sentences; Gemini (if key) writes photo-search words + AI image prompt per sentence
+  voice   narration per sentence (ElevenLabs if key, else free Edge-TTS British voice)
+  visuals per sentence: verified real photo/clip (Wikimedia, Pexels) or AI image (Pollinations) - never a random one
   render  Ken-Burns animation, vintage grade, SFX, subtitles -> final.mp4 (1920x1080)
 """
-import argparse, asyncio, html, json, os, re, subprocess, sys, time
+import argparse, asyncio, html, json, math, os, re, subprocess, sys, time
+from urllib.parse import quote
 from pathlib import Path
 import requests
 
 W, H, FPS = 1920, 1080, 30
-LEAD, TAIL = 0.25, 0.75          # silence before / after narration in each scene
+LEAD, TAIL = 0.12, 0.30          # silence before / after narration in each sentence-scene
 UA = "OldBritishCarsVideoBot/1.0 (personal YouTube documentary project)"
 SFX_KINDS = {"engine", "road", "factory", "none"}
-GENERIC = ["vintage british car", "classic car road", "old car engine",
-           "vintage car interior", "british countryside road", "classic car showroom"]
-
-
 def log(m): print(m, flush=True)
 
 
@@ -39,106 +37,168 @@ def wc(t): return len(re.findall(r"\S+", t))
 
 
 # ----------------------------------------------------------------- PLAN
-STOP = set("""The A An In On At It This That These Those He She They We I You When While By For With But And Or As After
+STOPW = set("""a an the and or but if then so of to in on at by for with from as is are was were be been being am do does did
+have has had having it its this that these those he she they we you i his her their our your my me him them us who whom
+which what when where why how not no nor than too very can could would should will shall may might must just also only
+even still yet about into over under after before between through during without within against among per each every both
+either neither some any all most many much more less other another such own same there here again once one two three
+four five first second new old like made make makes made became become came come went go goes got get thing things
+something behind while until since because though although however meanwhile""".split())
+GENERIC_Q = {"car", "cars", "vehicle", "vehicles", "vintage", "british", "britain", "classic", "old", "photo", "image",
+             "picture", "uk", "english", "history", "historic", "historical"}
+CARWORDS = {"car", "cars", "automobile", "vehicle", "saloon", "sedan", "coupe", "motor", "roadster", "estate", "van", "lorry", "truck"}
+STOP_CAP = set("""The A An In On At It This That These Those He She They We I You When While By For With But And Or As After
 Before Then So If Its His Her Their Our One Some Many Most Today Now From To Of What Why How Where Who There Here Even
 Still Yet During Despite Although Because Since Once Every Each Both Was Were Is Are Had Has Have""".split())
 
 
+def stem(w): return w[:-1] if len(w) > 3 and w.endswith("s") else w
+
+
+def qtokens(q): return [stem(w) for w in re.findall(r"[a-z0-9]+", q.lower()) if w not in GENERIC_Q and w not in STOPW and len(w) > 1]
+
+
+def relevant(hay, query):
+    """Strict check: does the candidate's title/description really talk about what the sentence needs?"""
+    toks = qtokens(query)
+    if not toks: return False
+    hs = {stem(w) for w in re.findall(r"[a-z0-9]+", hay.lower())}
+    need_car = any(w in CARWORDS for w in re.findall(r"[a-z]+", query.lower()))
+    if need_car and not any(stem(c) in hs for c in CARWORDS): return False
+    hits = sum(1 for t in toks if t in hs)
+    return hits >= (len(toks) if len(toks) <= 2 else max(2, math.ceil(len(toks) * 0.6)))
+
+
 def extract_query(text):
-    seqs = re.findall(r"(?:[A-Z][A-Za-z0-9\-]+|\b\d{2,4}\b)(?:\s+(?:[A-Z][A-Za-z0-9\-]+|\d{2,4}))*", text)
     good = []
-    for s in seqs:
-        toks = s.split()
-        while toks and toks[0] in STOP: toks.pop(0)
+    for m in re.finditer(r"(?:[A-Z][A-Za-z0-9\-]+|\b\d{2,4}\b)(?:\s+(?:[A-Z][A-Za-z0-9\-]+|\d{2,4}))*", text):
+        toks = m.group(0).split()
+        if m.start() == 0 and len(toks) == 1: continue       # a lone capitalised first word is just the sentence start
+        while toks and toks[0] in STOP_CAP: toks.pop(0)
         if toks and not all(t.isdigit() for t in toks): good.append(" ".join(toks[:4]))
     good.sort(key=lambda g: (-(any(c.isdigit() for c in g) or len(g.split()) > 1), -len(g)))
     return good[0] if good else ""
 
 
+def keywords(text, n=4):
+    words = re.findall(r"[A-Za-z][A-Za-z\-']+", text)
+    cand = []
+    for k, w in enumerate(words):
+        if w.lower() in STOPW or len(w) < 3: continue
+        cand.append((k, w, (2 if (w[0].isupper() and k > 0) else 0) + len(w) / 10))
+    top = sorted(cand, key=lambda c: -c[2])[:n]
+    seen, out = set(), []
+    for k, w, _ in sorted(top):
+        if w.lower() not in seen: seen.add(w.lower()); out.append(w)
+    return " ".join(out)
+
+
+def guess_topic(script):
+    from collections import Counter
+    cnt = Counter(w.lower() for w in re.findall(r"[A-Za-z][A-Za-z\-]{3,}", script) if w.lower() not in STOPW and w.lower() not in GENERIC_Q)
+    top = [w for w, c in cnt.most_common(3) if c >= 2]
+    return ("British " + " ".join(top[:2]) + " vintage cars") if top else "vintage British cars"
+
+
 def guess_sfx(text, i):
     t = text.lower()
-    if re.search(r"engine|horsepower|race|racing|speed|motor|v8|v12|cylinder|rev", t): return "engine"
-    if re.search(r"factory|plant|assembly|built|production|workers|workshop", t): return "factory"
-    if re.search(r"drive|driving|road|journey|highway|motorway|travel", t): return "road"
-    return "road" if i % 3 == 0 else "none"
+    if re.search(r"\b(engines?|horsepower|rac(?:e|es|ing)|speed|motors?|v8|v12|cylinders?|revs?|chase|siren|sirens)\b", t): return "engine"
+    if re.search(r"\b(factory|plant|assembly|production|workers|workshop)\b", t): return "factory"
+    if re.search(r"\b(drive|drives|driving|road|roads|journey|highway|motorway|motorways|travel|street|streets)\b", t): return "road"
+    return "none"
 
 
-def heuristic_plan(script):
-    sents = re.split(r"(?<=[.!?])\s+", script.strip())
-    parts = []
-    for s in sents:                       # split very long sentences at commas
-        if wc(s) > 40:
-            parts += [p.strip() for p in re.split(r"(?<=,)\s+", s) if p.strip()]
-        else:
-            parts.append(s)
-    scenes, cur, n = [], [], 0
-    def flush():
-        nonlocal cur, n
-        if cur: scenes.append(" ".join(cur)); cur, n = [], 0
-    for p in parts:
-        w = wc(p)
-        if cur and n + w > 30: flush()
-        cur.append(p); n += w
-        if n >= 18: flush()
-    flush()
-    out = []
-    for i, t in enumerate(scenes):
-        q = extract_query(t)
-        out.append(dict(narration=t, search_query=q, fallback_query=GENERIC[i % len(GENERIC)], sfx=guess_sfx(t, i)))
+def split_long(s, maxw=24):
+    if wc(s) <= maxw: return [s]
+    out, cur = [], ""
+    for p in re.split(r"(?<=[,;:\u2014\u2013])\s+", s):
+        if cur and wc(cur) + wc(p) > maxw: out.append(cur); cur = p
+        else: cur = (cur + " " + p).strip()
+    if cur: out.append(cur)
+    if len(out) > 1 and wc(out[-1]) < 5: out[-2] += " " + out.pop()
     return out
 
 
-def gemini_plan(script, key):
+def split_units(script):
+    """One unit per sentence (very long ones are split at commas, tiny ones merged into the next)."""
+    units = []
+    for line in re.split(r"\n+", script):
+        line = line.strip()
+        if not line: continue
+        t = re.sub(r"\b(Mr|Mrs|Ms|Dr|St|Jr|Sr|vs|No|Ltd|Co|Inc|Mt|Prof)\.", r"\1<D>", line)
+        t = re.sub(r"(\d)\.(\d)", r"\1<D>\2", t)
+        for sent in re.split(r'(?<=[.!?\u2026]["\u201d\u2019)])\s+|(?<=[.!?\u2026])\s+', t):
+            sent = sent.replace("<D>", ".").strip()
+            if sent: units += split_long(sent)
+    merged, i = [], 0
+    while i < len(units):
+        if wc(units[i]) < 5 and i + 1 < len(units):
+            units[i + 1] = units[i] + " " + units[i + 1]; i += 1; continue
+        merged.append(units[i]); i += 1
+    if len(merged) > 1 and wc(merged[-1]) < 4: merged[-2] += " " + merged.pop()
+    return merged
+
+
+def heuristic_scene(u, i, topic):
+    return dict(narration=u, search_query=extract_query(u) or keywords(u, 3), image_prompt=u, sfx=guess_sfx(u, i))
+
+
+def gemini_annotate(units, key):
+    numbered = "\n".join(f"{i + 1}. {u}" for i, u in enumerate(units))
     prompt = (
-        "You are the director of an Old British Cars YouTube documentary.\n"
-        "Split the script into scenes of 15-30 words each, in order. Return JSON only:\n"
-        '{"scenes":[{"narration":"<exact script text, unchanged>","search_query":"<2-4 English words: the specific car '
-        'model, marque, place or object shown, suited to a photo search>","fallback_query":"<generic 2-3 word visual>",'
-        '"sfx":"engine|road|factory|none"}]}\n'
-        "Rules: never add, remove or rewrite any word of the script. Do not invent facts.\n\nSCRIPT:\n" + script)
+        "You are the visual director of a YouTube documentary about old British cars. The narration is split into numbered "
+        "sentences. For EVERY sentence choose visuals that literally show what THAT sentence says.\n"
+        'Return JSON only: {"topic":"<4-8 words: overall subject and era>","scenes":[{"i":1,'
+        '"search_query":"<2-5 English words for a photo search: the specific car model, marque, place or object named or implied '
+        'by this sentence; include the word car if a car is the subject>",'
+        '"image_prompt":"<one vivid sentence, 18-35 words, describing exactly what the camera sees for this sentence: subject, '
+        'setting, era, lighting. No text, logos or recognisable real people.>","sfx":"engine|road|factory|none"}]}\n'
+        "Rules: exactly one entry per sentence with the same number; be historically accurate; never invent facts.\n\nSENTENCES:\n" + numbered)
     body = {"contents": [{"parts": [{"text": prompt}]}],
-            "generationConfig": {"responseMimeType": "application/json", "temperature": 0.2}}
+            "generationConfig": {"responseMimeType": "application/json", "temperature": 0.3}}
     url = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent"
-    r = requests.post(url, headers={"x-goog-api-key": key}, json=body, timeout=180)
+    r = requests.post(url, headers={"x-goog-api-key": key}, json=body, timeout=240)
     r.raise_for_status()
     data = json.loads(r.json()["candidates"][0]["content"]["parts"][0]["text"])
-    items = data["scenes"] if isinstance(data, dict) else data
-    out = []
-    for s in items:
-        n = str(s.get("narration", "")).strip()
-        if not n: continue
-        sfx = s.get("sfx", "none")
-        out.append(dict(narration=n, search_query=str(s.get("search_query", "")).strip(),
-                        fallback_query=str(s.get("fallback_query", "")).strip() or GENERIC[len(out) % len(GENERIC)],
-                        sfx=sfx if sfx in SFX_KINDS else "none"))
-    ratio = sum(wc(s["narration"]) for s in out) / max(1, wc(script))
-    if not out or not 0.93 <= ratio <= 1.07:
-        raise ValueError(f"Gemini plan does not match script (ratio {ratio:.2f})")
-    return out
+    items = data.get("scenes", []) if isinstance(data, dict) else data
+    by_i = {}
+    for x in items:
+        try: by_i[int(x["i"])] = x
+        except Exception: pass
+    return str(data.get("topic", "")).strip() if isinstance(data, dict) else "", [by_i.get(i + 1) for i in range(len(units))]
 
 
 def stage_plan(a, st):
     script = re.sub(r"[ \t]+", " ", Path(a.script).read_text(encoding="utf-8")).strip()
     if not script: raise SystemExit("Script is empty")
-    scenes, key = None, os.getenv("GEMINI_API_KEY", "").strip()
+    units = split_units(script)
+    topic, notes, key = guess_topic(script), [None] * len(units), os.getenv("GEMINI_API_KEY", "").strip()
     if key and not a.offline:
         try:
-            scenes = gemini_plan(script, key); log(f"Gemini planned {len(scenes)} scenes")
+            t, notes = gemini_annotate(units, key); topic = t or topic
+            log(f"Gemini directed {sum(1 for n in notes if n)}/{len(units)} sentences")
         except Exception as e:
-            st["warnings"].append(f"Gemini plan failed, used built-in splitter: {str(e)[:120]}")
-    if not scenes:
-        scenes = heuristic_plan(script); log(f"Built-in splitter made {len(scenes)} scenes")
+            st["warnings"].append(f"Gemini failed, used built-in keyword logic: {str(e)[:120]}")
+    scenes = []
+    for i, u in enumerate(units):
+        h, n = heuristic_scene(u, i, topic), notes[i] or {}
+        sfx = n.get("sfx", h["sfx"])
+        scenes.append(dict(i=i, narration=u, search_query=str(n.get("search_query") or h["search_query"]).strip(),
+                           image_prompt=str(n.get("image_prompt") or h["image_prompt"]).strip(), sfx=sfx if sfx in SFX_KINDS else "none"))
+    for i, sc in enumerate(scenes):       # smooth ambient sound so it does not flip every sentence
+        w = [scenes[j]["sfx"] for j in (i - 1, i, i + 1) if 0 <= j < len(scenes)]
+        sc["sfx_final"] = max(set(w), key=lambda k: (w.count(k), k == sc["sfx"]))
     if a.max_scenes: scenes = scenes[:a.max_scenes]
-    for i, s in enumerate(scenes): s["i"] = i
-    st["scenes"] = scenes
+    st["scenes"], st["topic"] = scenes, topic
+    log(f"{len(scenes)} sentence-scenes. Topic: {topic}")
 
 
 # ----------------------------------------------------------------- VOICE
-def eleven_tts(text, out):
+def eleven_tts(text, out, prev="", nxt=""):
     key, voice = os.environ["ELEVENLABS_API_KEY"].strip(), os.getenv("ELEVENLABS_VOICE_ID", "").strip() or "JBFqnCBsd6RMkjVDRZzb"
     r = requests.post(f"https://api.elevenlabs.io/v1/text-to-speech/{voice}?output_format=mp3_44100_128",
                       headers={"xi-api-key": key}, timeout=180,
-                      json={"text": text, "model_id": "eleven_multilingual_v2"})
+                      json={"text": text, "model_id": "eleven_multilingual_v2", "previous_text": prev, "next_text": nxt})
     if r.status_code >= 400: raise RuntimeError(f"ElevenLabs HTTP {r.status_code}: {r.text[:150]}")
     Path(out).write_bytes(r.content)
 
@@ -158,7 +218,9 @@ def stage_voice(a, st):
     def synth_all(engine):
         for s in st["scenes"]:
             f = work / f"voice_{s['i']:03d}.{'mp3' if engine != 'silent' else 'wav'}"
-            if engine == "eleven": eleven_tts(s["narration"], f)
+            if engine == "eleven":
+                k = s["i"]; sc = st["scenes"]
+                eleven_tts(s["narration"], f, sc[k - 1]["narration"] if k else "", sc[k + 1]["narration"] if k + 1 < len(sc) else "")
             elif engine == "edge": edge_tts_save(s["narration"], f, a.voice)
             else: silent_voice(s["narration"], f)
             s["voice_file"], s["voice_dur"] = f.name, probe_dur(f)
@@ -196,9 +258,10 @@ def strip_html(s): return re.sub(r"\s+", " ", html.unescape(re.sub(r"<[^>]+>", "
 
 
 def wikimedia(query, path_base, used, credits):
+    """Only returns a file whose title/description/categories really match the query."""
     r = requests.get("https://commons.wikimedia.org/w/api.php", headers={"User-Agent": UA}, timeout=30, params=dict(
         action="query", format="json", generator="search", gsrsearch=f"{query} filetype:bitmap", gsrnamespace=6,
-        gsrlimit=20, prop="imageinfo", iiprop="url|size|mime|extmetadata", iiurlwidth=1920))
+        gsrlimit=30, prop="imageinfo", iiprop="url|size|mime|extmetadata", iiurlwidth=1920))
     pages = sorted(((r.json().get("query") or {}).get("pages") or {}).values(), key=lambda p: p.get("index", 99))
     for p in pages:
         ii = (p.get("imageinfo") or [{}])[0]
@@ -208,6 +271,9 @@ def wikimedia(query, path_base, used, credits):
         md = ii.get("extmetadata", {})
         lic = (md.get("LicenseShortName") or {}).get("value", "")
         if not url or url in used or not lic or "fair use" in lic.lower(): continue
+        hay = " ".join([p.get("title", ""), strip_html((md.get("ImageDescription") or {}).get("value")),
+                        strip_html((md.get("ObjectName") or {}).get("value")), strip_html((md.get("Categories") or {}).get("value")).replace("|", " ")])
+        if not relevant(hay, query): continue
         path = Path(str(path_base) + (".png" if ii["mime"] == "image/png" else ".jpg"))
         download(url, path); used.add(url)
         credits.append(f"{p.get('title', '').replace('File:', '')} - {strip_html((md.get('Artist') or {}).get('value'))} "
@@ -222,21 +288,51 @@ def pexels(query, path_base, used, credits, want_video):
     h = {"Authorization": key}
     if want_video:
         r = requests.get("https://api.pexels.com/videos/search", headers=h, timeout=30,
-                         params={"query": query, "per_page": 12, "orientation": "landscape"})
+                         params={"query": query, "per_page": 15, "orientation": "landscape"})
         for v in r.json().get("videos", []):
             files = [f for f in v.get("video_files", []) if f.get("file_type") == "video/mp4" and (f.get("width") or 0) >= 1280]
-            if v.get("duration", 0) < 4 or not files or v["id"] in used: continue
+            if v.get("duration", 0) < 3 or not files or v["id"] in used: continue
+            if not relevant(v.get("url", "").split("/video/")[-1].replace("-", " "), query): continue
             f = min(files, key=lambda f: abs(f["width"] - 1920))
             path = Path(str(path_base) + ".mp4"); download(f["link"], path); used.add(v["id"])
             credits.append(f"Pexels video by {v.get('user', {}).get('name', '')} - {v.get('url', '')}")
             return path, "video"
         return None
     r = requests.get("https://api.pexels.com/v1/search", headers=h, timeout=30,
-                     params={"query": query, "per_page": 12, "orientation": "landscape"})
+                     params={"query": query, "per_page": 15, "orientation": "landscape"})
     for p in r.json().get("photos", []):
         if p["id"] in used: continue
+        if not relevant(p.get("alt", "") + " " + p.get("url", "").split("/photo/")[-1].replace("-", " "), query): continue
         path = Path(str(path_base) + ".jpg"); download(p["src"]["large2x"], path); used.add(p["id"])
         credits.append(f"Pexels photo by {p.get('photographer', '')} - {p.get('url', '')}")
+        return path, "image"
+    return None
+
+
+AI_STYLE = "authentic documentary photograph, realistic, natural light, sharp focus, no text, no captions, no logos, no watermark"
+_ai = {"last": 0.0, "fails": 0}
+
+
+def ai_image(prompt, seed, path_base):
+    """AI picture for exactly this sentence (Pollinations; free without a key, faster with POLLINATIONS_API_KEY)."""
+    key = os.getenv("POLLINATIONS_API_KEY", "").strip()
+    wait = _ai["last"] + (5 if key else 16) - time.time()
+    if wait > 0: time.sleep(wait)
+    q = quote(f"{prompt}. {AI_STYLE}"[:900])
+    if key: url, hdr = f"https://gen.pollinations.ai/image/{q}?width=1920&height=1080&model=flux&seed={seed}&nologo=true", {"Authorization": "Bearer " + key}
+    else: url, hdr = f"https://image.pollinations.ai/prompt/{q}?width=1920&height=1080&model=flux&seed={seed}&nologo=true", {}
+    hdr["User-Agent"] = UA
+    for attempt in range(4):
+        _ai["last"] = time.time()
+        try:
+            r = requests.get(url, headers=hdr, timeout=200)
+        except requests.RequestException:
+            time.sleep(10); continue
+        if r.status_code == 429 or r.status_code >= 500: time.sleep(16); continue
+        c = r.content
+        ext = ".png" if c[:4] == b"\x89PNG" else ".jpg" if c[:2] == b"\xff\xd8" else None
+        if r.status_code != 200 or not ext or len(c) < 20000: return None
+        path = Path(str(path_base) + ext); path.write_bytes(c)
         return path, "image"
     return None
 
@@ -244,45 +340,56 @@ def pexels(query, path_base, used, credits, want_video):
 FONTS = ["/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", "/usr/share/fonts/dejavu/DejaVuSans-Bold.ttf"]
 
 
-def make_card(text, path, i):
+def make_card(path, i):
     cols = ["0x16301c", "0x2b1d12", "0x1a2233", "0x2a1a1a"]
-    tf = Path(str(path) + ".txt"); tf.write_text(re.sub(r"(.{1,34})(\s+|$)", r"\1\n", text or "Old British Cars").strip(), encoding="utf-8")
-    font = next((f for f in FONTS if os.path.exists(f)), None)
-    vf = "vignette=PI/3"
-    if font: vf += f",drawtext=fontfile={font}:textfile={tf.name}:fontcolor=white@0.9:fontsize=70:line_spacing=12:x=(w-text_w)/2:y=(h-text_h)/2"
-    run(["ffmpeg", "-y", "-f", "lavfi", "-i", f"color=c={cols[i % 4]}:s={W}x{H}", "-vf", vf, "-frames:v", "1", path.name], cwd=path.parent)
+    run(["ffmpeg", "-y", "-f", "lavfi", "-i", f"color=c={cols[i % 4]}:s={W}x{H}", "-vf", "vignette=PI/3", "-frames:v", "1", path.name], cwd=path.parent)
     return path
 
 
 def stage_visuals(a, st):
-    work, used, credits = Path(a.work), set(), st.setdefault("credits", [])
-    have_pexels = bool(os.getenv("PEXELS_API_KEY", "").strip())
+    used, credits = set(), []
+    st["credits"] = credits
+    have_pexels, mode, topic = bool(os.getenv("PEXELS_API_KEY", "").strip()), a.visuals, st.get("topic", "")
+    order = {"auto": ["wiki", "pvideo", "ai", "pphoto"], "ai": ["ai", "wiki", "pvideo", "pphoto"], "real": ["wiki", "pvideo", "pphoto"]}[mode]
+    src_count = {}
     for s in st["scenes"]:
-        i, base, got = s["i"], Path(a.work) / f"vis_{s['i']:03d}", None
-        queries = [q for q in (s["search_query"], s["fallback_query"], GENERIC[i % len(GENERIC)]) if q]
-        prefer_video = have_pexels and s["sfx"] in ("engine", "road")
-        if not a.offline:
-            attempts = []
-            for q in queries:
-                if prefer_video: attempts.append(lambda q=q: pexels(q, base, used, credits, True))
-                attempts.append(lambda q=q: wikimedia(q, base, used, credits))
-                if have_pexels:
-                    if not prefer_video: attempts.append(lambda q=q: pexels(q, base, used, credits, True))
-                    attempts.append(lambda q=q: pexels(q, base, used, credits, False))
-            for fn in attempts:
-                try:
-                    got = fn()
-                except Exception as e:
-                    log(f"  visual lookup error: {str(e)[:100]}"); got = None
-                if got: break
-                time.sleep(0.4)
-        if got:
-            s["visual_file"], s["visual_kind"] = got[0].name, got[1]
+        i, base, got, src = s["i"], Path(a.work) / f"vis_{s['i']:03d}", None, ""
+        queries = [q for q in dict.fromkeys([s["search_query"], keywords(s["narration"], 3)]) if q]
+        for step in ([] if a.offline else order):
+            try:
+                if step == "wiki":
+                    for q in queries:
+                        got = wikimedia(q, base, used, credits)
+                        if got: break
+                        time.sleep(0.3)
+                elif step in ("pvideo", "pphoto") and have_pexels:
+                    for q in queries:
+                        got = pexels(q, base, used, credits, step == "pvideo")
+                        if got: break
+                elif step == "ai" and _ai["fails"] < 3:
+                    got = ai_image(f"{s['image_prompt']} ({topic})" if topic else s["image_prompt"], 1000 + i, base)
+                    _ai["fails"] = 0 if got else _ai["fails"] + 1
+                    if _ai["fails"] == 3: st["warnings"].append("AI image service failed 3 times in a row - switched it off for the rest of this video")
+            except Exception as e:
+                log(f"  visual lookup error ({step}): {str(e)[:100]}"); got = None
+            if got: src = step; break
+        if got: s["visual_file"], s["visual_kind"], s["source"] = got[0].name, got[1], src
+        else: s["visual_file"] = ""
+        src_count[src or "-"] = src_count.get(src or "-", 0) + 1
+        log(f"  {i + 1}/{len(st['scenes'])} [{src or 'none yet'}] {s['narration'][:60]}")
+    # sentences with no picture reuse the nearest good one (different camera move) - never a random unrelated photo
+    good = [s for s in st["scenes"] if s["visual_file"]]
+    for s in st["scenes"]:
+        if s["visual_file"]: continue
+        if good:
+            ref = min(good, key=lambda g: (abs(g["i"] - s["i"]), g["i"] > s["i"]))
+            s["visual_file"], s["visual_kind"], s["source"] = ref["visual_file"], ref["visual_kind"], "reused"
         else:
-            make_card(s["search_query"] or s["fallback_query"], Path(str(base) + ".png"), i)
-            s["visual_file"], s["visual_kind"] = base.name + ".png", "image"
-            if not a.offline: st["warnings"].append(f"Scene {i + 1}: no photo found, used title card")
-        log(f"  visual {i + 1}/{len(st['scenes'])}: {s['visual_kind']} ({s['search_query'] or s['fallback_query']})")
+            s["visual_file"], s["visual_kind"], s["source"] = make_card(Path(a.work) / f"vis_{s['i']:03d}.png", s["i"]).name, "image", "card"
+        st["warnings"].append(f"Sentence {s['i'] + 1}: no matching picture found, reused a neighbouring one")
+    if any(s.get("source") == "ai" for s in st["scenes"]):
+        credits.append("Some images are AI-generated illustrations (Pollinations.ai). Tick 'altered or synthetic content' in YouTube Studio.")
+    log("Picture sources: " + ", ".join(f"{k}={v}" for k, v in src_count.items()))
 
 
 # ----------------------------------------------------------------- RENDER
@@ -342,10 +449,10 @@ def sfx_source(kind, D):
 
 
 def motion(i, N):
-    return [("1+0.15*on/%d" % N, "iw/2-(iw/zoom/2)", "ih/2-(ih/zoom/2)"),
-            ("1.15-0.15*on/%d" % N, "iw/2-(iw/zoom/2)", "ih/2-(ih/zoom/2)"),
-            ("1.12", "(iw-iw/zoom)*on/%d" % N, "(ih-ih/zoom)/2"),
-            ("1.12", "(iw-iw/zoom)*(1-on/%d)" % N, "(ih-ih/zoom)/2")][i % 4]
+    return [("1+0.12*on/%d" % N, "iw/2-(iw/zoom/2)", "ih/2-(ih/zoom/2)"),
+            ("1.12-0.12*on/%d" % N, "iw/2-(iw/zoom/2)", "ih/2-(ih/zoom/2)"),
+            ("1.10", "(iw-iw/zoom)*on/%d" % N, "(ih-ih/zoom)/2"),
+            ("1.10", "(iw-iw/zoom)*(1-on/%d)" % N, "(ih-ih/zoom)/2")][i % 4]
 
 
 def render_segment(s, work, D, style, subs):
@@ -366,16 +473,16 @@ def render_segment(s, work, D, style, subs):
                   "vignette=angle=PI/5[v1]")
     else:
         fc.append("[v0]null[v1]")
-    fc.append(f"[v1]fade=t=in:st=0:d=0.4,fade=t=out:st={D - 0.4:.2f}:d=0.4[v2]")
+    fc.append(f"[v1]fade=t=in:st=0:d=0.12,fade=t=out:st={D - 0.12:.2f}:d=0.12[v2]")
     fc.append(f"[v2]ass=s_{i:03d}.ass[vout]" if subs else "[v2]null[vout]")
     fc.append(f"[1:a]aresample=44100,aformat=channel_layouts=stereo,adelay={int(LEAD * 1000)}:all=1,apad=whole_dur={D:.2f}[va]")
     k = 2
-    src = sfx_source(s["sfx"], D)
+    src = sfx_source(s.get("sfx_final", s["sfx"]), D)
     if src:
         cmd += ["-f", "lavfi", "-i", src[0]]
-        fc.append(f"[{k}:a]{src[1]},aformat=channel_layouts=stereo,volume={src[2]},afade=t=in:d=0.6,afade=t=out:st={D - 0.6:.2f}:d=0.6[sa]")
+        fc.append(f"[{k}:a]{src[1]},aformat=channel_layouts=stereo,volume={src[2]},afade=t=in:d=0.08,afade=t=out:st={D - 0.08:.2f}:d=0.08[sa]")
         mix.append("[sa]"); k += 1
-    if i > 0:  # whoosh accent at scene change
+    if i > 0 and i % 4 == 0:  # occasional whoosh accent
         cmd += ["-f", "lavfi", "-i", "anoisesrc=color=white:amplitude=1.0:duration=0.9:sample_rate=44100"]
         fc.append(f"[{k}:a]highpass=f=400,lowpass=f=5000,aformat=channel_layouts=stereo,afade=t=in:d=0.35,"
                   f"afade=t=out:st=0.35:d=0.5,volume=0.12,apad=whole_dur={D:.2f}[wh]")
@@ -394,7 +501,7 @@ def stage_render(a, st):
     from concurrent.futures import ThreadPoolExecutor
     total = len(st["scenes"])
     for s in st["scenes"]:
-        s["dur"] = max(3.0, s["voice_dur"] + LEAD + TAIL)
+        s["dur"] = max(2.0, s["voice_dur"] + LEAD + TAIL)
         if a.subtitles: write_ass(s, work / f"s_{s['i']:03d}.ass")
     workers = max(1, min(3, (os.cpu_count() or 1) // 2 or 1))
     log(f"  rendering {total} scenes with {workers} parallel worker(s)")
@@ -437,6 +544,7 @@ def main():
     ap.add_argument("--script", default="work/script.txt"); ap.add_argument("--work", default="work"); ap.add_argument("--out", default="out")
     ap.add_argument("--voice", default="en-GB-RyanNeural"); ap.add_argument("--voice-engine", default="auto", choices=["auto", "edge", "eleven"])
     ap.add_argument("--style", default="vintage", choices=["vintage", "clean"])
+    ap.add_argument("--visuals", default="auto", choices=["auto", "ai", "real"], help="auto: verified real photo else AI; ai: AI image for every sentence; real: photos only")
     ap.add_argument("--subtitles", default="true"); ap.add_argument("--max-scenes", type=int, default=0)
     ap.add_argument("--offline", action="store_true", help="no network: title cards + silent voice (for testing)")
     a = ap.parse_args(); a.subtitles = str(a.subtitles).lower() in ("1", "true", "yes", "on")

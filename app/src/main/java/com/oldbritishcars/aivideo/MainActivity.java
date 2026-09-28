@@ -52,6 +52,11 @@ public class MainActivity extends Activity {
     static final String[] VOICE_LABELS = {
             "Auto (ElevenLabs if set, else British male)",
             "British male - Ryan", "British male - Thomas", "British female - Sonia"};
+    static final String[] VIS_LABELS = {
+            "Images: Auto (matching real photo, else AI)",
+            "Images: AI picture for every sentence",
+            "Images: Real photos only"};
+    static final String[] VIS_VALUE = {"auto", "ai", "real"};
     static final String[] VOICE_ENGINE = {"auto", "edge", "edge", "edge"};
     static final String[] VOICE_NAME = {"en-GB-RyanNeural", "en-GB-RyanNeural", "en-GB-ThomasNeural", "en-GB-SoniaNeural"};
 
@@ -61,7 +66,7 @@ public class MainActivity extends Activity {
     ProgressBar bar;
     Button create, openBtn;
     CheckBox subsCb, vintageCb;
-    Spinner voiceSp;
+    Spinner voiceSp, visSp;
     LinearLayout setupBox;
     volatile boolean busy = false;
     Uri savedUri;
@@ -169,6 +174,10 @@ public class MainActivity extends Activity {
         voiceSp.setAdapter(new ArrayAdapter<>(this, android.R.layout.simple_spinner_dropdown_item, VOICE_LABELS));
         r.addView(voiceSp);
 
+        visSp = new Spinner(this);
+        visSp.setAdapter(new ArrayAdapter<>(this, android.R.layout.simple_spinner_dropdown_item, VIS_LABELS));
+        r.addView(visSp);
+
         create = btn("CREATE VIDEO  (1 CLICK)");
         r.addView(create);
         create.setOnClickListener(v -> onCreateClicked());
@@ -245,6 +254,7 @@ public class MainActivity extends Activity {
         JSONObject in;
         try {
             in = new JSONObject().put("voice_engine", VOICE_ENGINE[v]).put("voice", VOICE_NAME[v])
+                    .put("visuals", VIS_VALUE[visSp.getSelectedItemPosition()])
                     .put("style", vintageCb.isChecked() ? "vintage" : "clean").put("subtitles", subsCb.isChecked() ? "true" : "false")
                     .put("script", s);
         } catch (Exception e) {
