@@ -1,0 +1,62 @@
+name: Render Video
+run-name: "Render ${{ inputs.job_id }}"
+
+on:
+  workflow_dispatch:
+    inputs:
+      job_id:       { description: "Job id (sent by the app)", required: true,  type: string }
+      script:       { description: "Video script",            required: true,  type: string }
+      voice_engine: { description: "auto | edge | eleven",     required: false, type: string, default: "auto" }
+      voice:        { description: "Edge-TTS voice name",      required: false, type: string, default: "en-GB-RyanNeural" }
+      style:        { description: "vintage | clean",          required: false, type: string, default: "vintage" }
+      subtitles:    { description: "true | false",             required: false, type: string, default: "true" }
+
+permissions:
+  contents: write
+
+jobs:
+  render:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    env:
+      GEMINI_API_KEY:      ${{ secrets.GEMINI_API_KEY }}
+      ELEVENLABS_API_KEY:  ${{ secrets.ELEVENLABS_API_KEY }}
+      ELEVENLABS_VOICE_ID: ${{ secrets.ELEVENLABS_VOICE_ID }}
+      PEXELS_API_KEY:      ${{ secrets.PEXELS_API_KEY }}
+      SCRIPT_TEXT:  ${{ inputs.script }}
+      VOICE:        ${{ inputs.voice }}
+      VOICE_ENGINE: ${{ inputs.voice_engine }}
+      STYLE:        ${{ inputs.style }}
+      SUBS:         ${{ inputs.subtitles }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install tools
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y ffmpeg fonts-dejavu-core
+          pip install requests edge-tts
+          mkdir -p work out
+          printf '%s' "$SCRIPT_TEXT" > work/script.txt
+
+      - name: "1/4 Plan scenes"
+        run: python pipeline/make_video.py --stage plan
+
+      - name: "2/4 Narration voice"
+        run: python pipeline/make_video.py --stage voice --voice "$VOICE" --voice-engine "$VOICE_ENGINE"
+
+      - name: "3/4 Find visuals"
+        run: python pipeline/make_video.py --stage visuals
+
+      - name: "4/4 Render 1080p video"
+        run: python pipeline/make_video.py --stage render --style "$STYLE" --subtitles "$SUBS"
+
+      - name: Publish video
+        env:
+          GH_TOKEN: ${{ github.token }}
+          JOB: ${{ inputs.job_id }}
+        run: |
+          gh release create "video-$JOB" out/final.mp4 out/credits.txt out/subtitles.srt out/scene_plan.json \
+            --title "Video $JOB" --notes "Rendered automatically." --target "$GITHUB_SHA"
+          gh release list --limit 100 --json tagName --jq '.[].tagName' | grep '^video-' | tail -n +9 \
+            | xargs -r -I{} gh release delete {} --cleanup-tag -y
