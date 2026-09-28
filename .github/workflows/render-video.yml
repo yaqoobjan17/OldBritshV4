@@ -10,6 +10,7 @@ on:
       voice:        { description: "Edge-TTS voice name",      required: false, type: string, default: "en-GB-RyanNeural" }
       style:        { description: "vintage | clean",          required: false, type: string, default: "vintage" }
       subtitles:    { description: "true | false",             required: false, type: string, default: "true" }
+      visuals:      { description: "auto | ai | real",         required: false, type: string, default: "auto" }
 
 permissions:
   contents: write
@@ -23,11 +24,13 @@ jobs:
       ELEVENLABS_API_KEY:  ${{ secrets.ELEVENLABS_API_KEY }}
       ELEVENLABS_VOICE_ID: ${{ secrets.ELEVENLABS_VOICE_ID }}
       PEXELS_API_KEY:      ${{ secrets.PEXELS_API_KEY }}
+      POLLINATIONS_API_KEY: ${{ secrets.POLLINATIONS_API_KEY }}
       SCRIPT_TEXT:  ${{ inputs.script }}
       VOICE:        ${{ inputs.voice }}
       VOICE_ENGINE: ${{ inputs.voice_engine }}
       STYLE:        ${{ inputs.style }}
       SUBS:         ${{ inputs.subtitles }}
+      VISUALS:      ${{ inputs.visuals }}
     steps:
       - uses: actions/checkout@v4
 
@@ -46,7 +49,7 @@ jobs:
         run: python pipeline/make_video.py --stage voice --voice "$VOICE" --voice-engine "$VOICE_ENGINE"
 
       - name: "3/4 Find visuals"
-        run: python pipeline/make_video.py --stage visuals
+        run: python pipeline/make_video.py --stage visuals --visuals "$VISUALS"
 
       - name: "4/4 Render 1080p video"
         run: python pipeline/make_video.py --stage render --style "$STYLE" --subtitles "$SUBS"
@@ -58,5 +61,6 @@ jobs:
         run: |
           gh release create "video-$JOB" out/final.mp4 out/credits.txt out/subtitles.srt out/scene_plan.json \
             --title "Video $JOB" --notes "Rendered automatically." --target "$GITHUB_SHA"
+          # keep only the 8 newest videos so storage stays small
           gh release list --limit 100 --json tagName --jq '.[].tagName' | grep '^video-' | tail -n +9 \
             | xargs -r -I{} gh release delete {} --cleanup-tag -y
