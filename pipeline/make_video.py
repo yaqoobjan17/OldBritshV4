@@ -63,8 +63,7 @@ def relevant(hay, query):
     toks = qtokens(query)
     if not toks: return False
     hs = {stem(w) for w in re.findall(r"[a-z0-9]+", hay.lower())}
-    need_car = any(w in CARWORDS for w in re.findall(r"[a-z]+", query.lower()))
-    if need_car and not any(stem(c) in hs for c in CARWORDS): return False
+    if not any(stem(c) in hs for c in CARWORDS): return False     # channel topic = cars: a car word must be in the text
     hits = sum(1 for t in toks if t in hs)
     return hits >= (len(toks) if len(toks) <= 2 else max(2, math.ceil(len(toks) * 0.6)))
 
@@ -140,22 +139,31 @@ def split_units(script):
 
 
 def heuristic_scene(u, i, topic):
-    return dict(narration=u, search_query=extract_query(u) or keywords(u, 3), image_prompt=u, sfx=guess_sfx(u, i))
+    return dict(narration=u, search_query=extract_query(u) or keywords(u, 3),
+                image_prompt=f"{topic}: a vintage British car scene illustrating - {u}", sfx=guess_sfx(u, i))
 
 
 def gemini_annotate(units, key):
     numbered = "\n".join(f"{i + 1}. {u}" for i, u in enumerate(units))
     prompt = (
-        "You are the visual director of a YouTube documentary about old British cars. The narration is split into numbered "
-        "sentences. For EVERY sentence choose visuals that literally show what THAT sentence says.\n"
-        'Return JSON only: {"topic":"<4-8 words: overall subject and era>","scenes":[{"i":1,'
-        '"search_query":"<2-5 English words for a photo search: the specific car model, marque, place or object named or implied '
-        'by this sentence; include the word car if a car is the subject>",'
-        '"image_prompt":"<one vivid sentence, 18-35 words, describing exactly what the camera sees for this sentence: subject, '
-        'setting, era, lighting. No text, logos or recognisable real people.>","sfx":"engine|road|factory|none"}]}\n'
-        "Rules: exactly one entry per sentence with the same number; be historically accurate; never invent facts.\n\nSENTENCES:\n" + numbered)
+        "You are the art director of a cinematic YouTube documentary about old British cars. The narration is split into "
+        "numbered sentences. For EVERY sentence design ONE striking image.\n"
+        'Return JSON only: {"topic":"<4-8 words: overall subject and era>",'
+        '"style":"<ONE reusable visual style line for ALL images: film stock, colour palette, light, era, mood>",'
+        '"scenes":[{"i":1,"search_query":"<2-5 English words for a photo search: the specific car model, marque or place in THIS '
+        'sentence; include the word car when a car is the subject>",'
+        '"image_prompt":"<one vivid sentence, 25-45 words, describing exactly what the camera sees: the specific vehicle (marque, '
+        'model, colour, era), the setting, camera angle/shot type and light. No text, no readable number plates, no logos, no '
+        'recognisable real people.>","sfx":"engine|road|factory|none"}]}\n'
+        "Rules:\n"
+        "- exactly one entry per sentence, same numbering; be historically accurate; never invent facts.\n"
+        "- EVERY image must feature a vintage British car or a period automotive scene (street, garage, factory, showroom, "
+        "police station, motorway). For abstract or figurative sentences, show a concrete car scene that fits the mood - never a "
+        "literal object such as fruit, insects, animals or drawings.\n"
+        "- vary the shots: wide establishing, low-angle hero shot, close-up of grille/badge/headlamp/dashboard, interior, "
+        "motion on the road, rear three-quarter, night with headlights.\n\nSENTENCES:\n" + numbered)
     body = {"contents": [{"parts": [{"text": prompt}]}],
-            "generationConfig": {"responseMimeType": "application/json", "temperature": 0.3}}
+            "generationConfig": {"responseMimeType": "application/json", "temperature": 0.5}}
     url = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent"
     r = requests.post(url, headers={"x-goog-api-key": key}, json=body, timeout=240)
     r.raise_for_status()
@@ -165,17 +173,20 @@ def gemini_annotate(units, key):
     for x in items:
         try: by_i[int(x["i"])] = x
         except Exception: pass
-    return str(data.get("topic", "")).strip() if isinstance(data, dict) else "", [by_i.get(i + 1) for i in range(len(units))]
+    topic = str(data.get("topic", "")).strip() if isinstance(data, dict) else ""
+    style = str(data.get("style", "")).strip() if isinstance(data, dict) else ""
+    return topic, style, [by_i.get(i + 1) for i in range(len(units))]
 
 
 def stage_plan(a, st):
     script = re.sub(r"[ \t]+", " ", Path(a.script).read_text(encoding="utf-8")).strip()
     if not script: raise SystemExit("Script is empty")
     units = split_units(script)
-    topic, notes, key = guess_topic(script), [None] * len(units), os.getenv("GEMINI_API_KEY", "").strip()
+    topic, style, notes, key = guess_topic(script), "", [None] * len(units), os.getenv("GEMINI_API_KEY", "").strip()
+    if not key: st["warnings"].append("No GEMINI_API_KEY secret found - using basic keyword logic (pictures will match worse)")
     if key and not a.offline:
         try:
-            t, notes = gemini_annotate(units, key); topic = t or topic
+            t, sty, notes = gemini_annotate(units, key); topic, style = t or topic, sty
             log(f"Gemini directed {sum(1 for n in notes if n)}/{len(units)} sentences")
         except Exception as e:
             st["warnings"].append(f"Gemini failed, used built-in keyword logic: {str(e)[:120]}")
@@ -189,7 +200,7 @@ def stage_plan(a, st):
         w = [scenes[j]["sfx"] for j in (i - 1, i, i + 1) if 0 <= j < len(scenes)]
         sc["sfx_final"] = max(set(w), key=lambda k: (w.count(k), k == sc["sfx"]))
     if a.max_scenes: scenes = scenes[:a.max_scenes]
-    st["scenes"], st["topic"] = scenes, topic
+    st["scenes"], st["topic"], st["style"] = scenes, topic, style
     log(f"{len(scenes)} sentence-scenes. Topic: {topic}")
 
 
@@ -309,16 +320,17 @@ def pexels(query, path_base, used, credits, want_video):
     return None
 
 
-AI_STYLE = "authentic documentary photograph, realistic, natural light, sharp focus, no text, no captions, no logos, no watermark"
+AI_STYLE = ("cinematic 35mm film photograph, vintage British cars, muted natural colours, soft overcast light, shallow depth of field, "
+            "highly detailed, professional automotive photography, no text, no captions, no logos, no watermark")
 _ai = {"last": 0.0, "fails": 0}
 
 
-def ai_image(prompt, seed, path_base):
+def ai_image(prompt, seed, path_base, style=""):
     """AI picture for exactly this sentence (Pollinations; free without a key, faster with POLLINATIONS_API_KEY)."""
     key = os.getenv("POLLINATIONS_API_KEY", "").strip()
     wait = _ai["last"] + (5 if key else 16) - time.time()
     if wait > 0: time.sleep(wait)
-    q = quote(f"{prompt}. {AI_STYLE}"[:900])
+    q = quote(f"{prompt}. {style or AI_STYLE}"[:900])
     if key: url, hdr = f"https://gen.pollinations.ai/image/{q}?width=1920&height=1080&model=flux&seed={seed}&nologo=true", {"Authorization": "Bearer " + key}
     else: url, hdr = f"https://image.pollinations.ai/prompt/{q}?width=1920&height=1080&model=flux&seed={seed}&nologo=true", {}
     hdr["User-Agent"] = UA
@@ -350,7 +362,7 @@ def stage_visuals(a, st):
     used, credits = set(), []
     st["credits"] = credits
     have_pexels, mode, topic = bool(os.getenv("PEXELS_API_KEY", "").strip()), a.visuals, st.get("topic", "")
-    order = {"auto": ["wiki", "pvideo", "ai", "pphoto"], "ai": ["ai", "wiki", "pvideo", "pphoto"], "real": ["wiki", "pvideo", "pphoto"]}[mode]
+    order = {"auto": ["ai", "wiki", "pvideo", "pphoto"], "ai": ["ai"], "real": ["wiki", "pvideo", "pphoto"]}[mode]
     src_count = {}
     for s in st["scenes"]:
         i, base, got, src = s["i"], Path(a.work) / f"vis_{s['i']:03d}", None, ""
@@ -367,13 +379,13 @@ def stage_visuals(a, st):
                         got = pexels(q, base, used, credits, step == "pvideo")
                         if got: break
                 elif step == "ai" and _ai["fails"] < 3:
-                    got = ai_image(f"{s['image_prompt']} ({topic})" if topic else s["image_prompt"], 1000 + i, base)
+                    got = ai_image(s["image_prompt"], 1000 + i, base, st.get("style", ""))
                     _ai["fails"] = 0 if got else _ai["fails"] + 1
                     if _ai["fails"] == 3: st["warnings"].append("AI image service failed 3 times in a row - switched it off for the rest of this video")
             except Exception as e:
                 log(f"  visual lookup error ({step}): {str(e)[:100]}"); got = None
             if got: src = step; break
-        if got: s["visual_file"], s["visual_kind"], s["source"] = got[0].name, got[1], src
+        if got: s["visual_file"], s["visual_kind"], s["source"], s["wm"] = got[0].name, got[1], src, (src == "ai")
         else: s["visual_file"] = ""
         src_count[src or "-"] = src_count.get(src or "-", 0) + 1
         log(f"  {i + 1}/{len(st['scenes'])} [{src or 'none yet'}] {s['narration'][:60]}")
@@ -383,7 +395,7 @@ def stage_visuals(a, st):
         if s["visual_file"]: continue
         if good:
             ref = min(good, key=lambda g: (abs(g["i"] - s["i"]), g["i"] > s["i"]))
-            s["visual_file"], s["visual_kind"], s["source"] = ref["visual_file"], ref["visual_kind"], "reused"
+            s["visual_file"], s["visual_kind"], s["source"], s["wm"] = ref["visual_file"], ref["visual_kind"], "reused", ref.get("wm", False)
         else:
             s["visual_file"], s["visual_kind"], s["source"] = make_card(Path(a.work) / f"vis_{s['i']:03d}.png", s["i"]).name, "image", "card"
         st["warnings"].append(f"Sentence {s['i'] + 1}: no matching picture found, reused a neighbouring one")
@@ -464,7 +476,8 @@ def render_segment(s, work, D, style, subs):
     fc, mix = [], ["[va]"]
     if kind == "image":
         N = int(D * FPS) + 2; z, x, y = motion(i, N)
-        fc.append(f"[0:v]scale=2400:1350:force_original_aspect_ratio=increase,crop=2400:1350,setsar=1,"
+        pre = "crop=iw:ih*0.93:0:0," if (s.get("wm") and not os.getenv("POLLINATIONS_API_KEY", "").strip()) else ""
+        fc.append(f"[0:v]{pre}scale=2400:1350:force_original_aspect_ratio=increase,crop=2400:1350,setsar=1,"
                   f"zoompan=z='{z}':x='{x}':y='{y}':d={N}:s={W}x{H}:fps={FPS}[v0]")
     else:
         fc.append(f"[0:v]scale={W}:{H}:force_original_aspect_ratio=increase,crop={W}:{H},setsar=1,fps={FPS}[v0]")
