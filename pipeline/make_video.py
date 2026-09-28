@@ -8,7 +8,7 @@ Stages (each reads/writes work/state.json):
   visuals per sentence: verified real photo/clip (Wikimedia, Pexels) or AI image (Pollinations) - never a random one
   render  Ken-Burns animation, vintage grade, SFX, subtitles -> final.mp4 (1920x1080)
 """
-import argparse, asyncio, html, json, math, os, re, subprocess, sys, time
+import argparse, asyncio, html, json, math, os, re, subprocess, sys, textwrap, time
 from urllib.parse import quote
 from pathlib import Path
 import requests
@@ -143,6 +143,32 @@ def heuristic_scene(u, i, topic):
                 image_prompt=f"{topic}: a vintage British car scene illustrating - {u}", sfx=guess_sfx(u, i))
 
 
+GEMINI_MODELS = ["gemini-3.5-flash", "gemini-3-flash-preview", "gemini-2.5-flash", "gemini-2.5-flash-lite"]
+
+
+def gemini_call(body, key):
+    errors = []
+    for model in GEMINI_MODELS:
+        url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
+        try:
+            r = requests.post(url, headers={"x-goog-api-key": key}, json=body, timeout=240)
+        except requests.RequestException as e:
+            errors.append(f"{model}: network error {type(e).__name__}"); continue
+        if r.status_code == 200:
+            try:
+                txt = r.json()["candidates"][0]["content"]["parts"][0]["text"]
+                json.loads(txt)
+                log(f"Gemini model used: {model}")
+                return txt
+            except Exception as e:
+                errors.append(f"{model}: unreadable answer ({type(e).__name__})"); continue
+        try: msg = r.json()["error"]["message"]
+        except Exception: msg = r.text[:150]
+        errors.append(f"{model}: HTTP {r.status_code} - {re.sub(r'AIza[\w-]+|AQ\.[\w.-]+', '<key>', msg)[:160]}")
+        if r.status_code in (400, 401) and "API key" in msg: break     # a bad key fails on every model
+    raise RuntimeError(" || ".join(errors))
+
+
 def gemini_annotate(units, key):
     numbered = "\n".join(f"{i + 1}. {u}" for i, u in enumerate(units))
     prompt = (
@@ -164,10 +190,7 @@ def gemini_annotate(units, key):
         "motion on the road, rear three-quarter, night with headlights.\n\nSENTENCES:\n" + numbered)
     body = {"contents": [{"parts": [{"text": prompt}]}],
             "generationConfig": {"responseMimeType": "application/json", "temperature": 0.5}}
-    url = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent"
-    r = requests.post(url, headers={"x-goog-api-key": key}, json=body, timeout=240)
-    r.raise_for_status()
-    data = json.loads(r.json()["candidates"][0]["content"]["parts"][0]["text"])
+    data = json.loads(gemini_call(body, key))
     items = data.get("scenes", []) if isinstance(data, dict) else data
     by_i = {}
     for x in items:
@@ -189,7 +212,8 @@ def stage_plan(a, st):
             t, sty, notes = gemini_annotate(units, key); topic, style = t or topic, sty
             log(f"Gemini directed {sum(1 for n in notes if n)}/{len(units)} sentences")
         except Exception as e:
-            st["warnings"].append(f"Gemini failed, used built-in keyword logic: {str(e)[:120]}")
+            log("GEMINI FAILED:\n" + "\n".join(textwrap.wrap(str(e).replace(" || ", "\n"), 60, replace_whitespace=False)))
+            st["warnings"].append("Gemini failed, used built-in keyword logic (see 'GEMINI FAILED' above)")
     scenes = []
     for i, u in enumerate(units):
         h, n = heuristic_scene(u, i, topic), notes[i] or {}
