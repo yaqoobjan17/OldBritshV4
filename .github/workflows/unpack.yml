@@ -8,8 +8,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - run: |
-          unzip -o OldBritishV4.zip -x '.github/*'
-          rm OldBritishV4.zip
+          ls -la
+          unzip -o ./*.zip -x '.github/*'
+          rm -f ./*.zip
           git config user.name github-actions
           git config user.email actions@github.com
           git add -A
