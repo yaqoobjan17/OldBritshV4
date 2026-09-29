@@ -143,7 +143,7 @@ def heuristic_scene(u, i, topic):
                 image_prompt=f"{topic}: a vintage British car scene illustrating - {u}", sfx=guess_sfx(u, i))
 
 
-GEMINI_MODELS = ["gemini-3.5-flash", "gemini-3-flash-preview", "gemini-2.5-flash", "gemini-2.5-flash-lite"]
+GEMINI_MODELS = ["gemini-3.8-flash", "gemini-3.5-flash-lite", "gemini-flash-latest", "gemini-2.5-flash"]
 
 
 def gemini_call(body, key):
