@@ -22,6 +22,20 @@ Script sentence-by-sentence toot-ti hai. Har sentence ki apni image hoti hai jo 
 App me 3 modes: **Auto** (asli photo tab jab wo sentence se sach me match kare, warna AI image), **AI har sentence ke liye**, **Real photos only**.
 **GEMINI_API_KEY zaroor daalo** (free): wo har sentence ke liye sahi search words aur image description likhta hai, is se matching bohat behtar hoti hai.
 
+## V10: Kisi bhi niche ke liye + aapke apne image prompts + asli crossfade
+Ab app kisi bhi topic ki script ke liye kaam karta hai (cars, kahani, cooking, tareekh — kuch bhi).
+
+**Naya box: 'Image prompts (optional)'.** Script ke neeche ek aur box hai. Agar aap chahte ho ke har sentence ki apni tay-shuda image ho, to yahan har line par ek prompt/keyword paste karo — jitne sentences hain utni hi lines, isi tarteeb me. Pipeline har sentence ke liye wahi prompt istemal karega (na Gemini na keyword-guessing, seedha aapka prompt). Khali chhod do to pehle jaisa auto-matching chalega.
+
+**Crossfade fix:** ab har sentence ki image asli dissolve (crossfade) ke sath badalti hai, hard-cut nahi hota, aur har image apne sentence ki lambai (2s ho ya 5s) ke hisab se hi chalti hai.
+
+**Noise fix:** engine/road jaisi synthetic ambient awaz jo narration ke neeche baji jati thi, poori tarah hata di gayi hai. Ab sirf saaf narration hoti hai (aur agar music.mp3 lagayi ho to wo).
+
+## V9: SEO pack + cinematic look
+Video ke saath ab `youtube_metadata.txt` bhi banti hai: 3 titles, description, hashtags, tags — Gemini khud likhta hai.
+App me video ready hone par **COPY TITLE, DESCRIPTION & TAGS** button aata hai, ek tap me sab clipboard me copy ho jata hai.
+Vintage look me ab halka film-grain aur vignette bhi hota hai (extra render time bohat kam).
+
 ## Roz ka kaam
 Script paste → **CREATE VIDEO**. Progress bar 4 steps dikhata hai (Plan → Voice → Visuals → Render).
 App band bhi kar do to video cloud me banti rehti hai; dobara khologe to khud download kar leti hai.

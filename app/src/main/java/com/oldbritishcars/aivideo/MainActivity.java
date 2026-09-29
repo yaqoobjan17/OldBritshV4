@@ -3,6 +3,8 @@ package com.oldbritishcars.aivideo;
 import android.app.Activity;
 import android.content.ContentValues;
 import android.content.Intent;
+import android.content.ClipData;
+import android.content.ClipboardManager;
 import android.content.SharedPreferences;
 import android.graphics.Color;
 import android.net.Uri;
@@ -61,10 +63,10 @@ public class MainActivity extends Activity {
     static final String[] VOICE_NAME = {"en-GB-RyanNeural", "en-GB-RyanNeural", "en-GB-ThomasNeural", "en-GB-SoniaNeural"};
 
     SharedPreferences prefs;
-    EditText script, repoEt, tokenEt;
+    EditText script, imagePrompts, repoEt, tokenEt;
     TextView status, result;
     ProgressBar bar;
-    Button create, openBtn;
+    Button create, openBtn, copyBtn;
     CheckBox subsCb, vintageCb;
     Spinner voiceSp, visSp;
     LinearLayout setupBox;
@@ -112,7 +114,7 @@ public class MainActivity extends Activity {
         sv.addView(r);
         setContentView(sv);
 
-        TextView h = tv("OLD BRITISH CARS\n1-CLICK VIDEO", 24, GREEN);
+        TextView h = tv("AI SCRIPT TO VIDEO\nANY TOPIC, 1-CLICK", 24, GREEN);
         h.setGravity(Gravity.CENTER);
         r.addView(h);
         r.addView(tv("Paste script -> one tap -> voice, visuals, SFX, animation, subtitles -> 1080p MP4", 13, Color.DKGRAY));
@@ -153,11 +155,20 @@ public class MainActivity extends Activity {
         });
 
         script = new EditText(this);
-        script.setHint("Paste your video script here...");
+        script.setHint("Paste your video script here (any topic)...");
         script.setGravity(Gravity.TOP);
         script.setMinLines(10);
         script.setTextSize(16);
         r.addView(script, new LinearLayout.LayoutParams(-1, -2));
+
+        r.addView(tv("Optional: one image prompt per line, same order and count as the sentences above. "
+                + "Leave empty to let AI choose automatically.", 12, Color.DKGRAY));
+        imagePrompts = new EditText(this);
+        imagePrompts.setHint("Sentence 1 image prompt/keywords\nSentence 2 image prompt/keywords\n...");
+        imagePrompts.setGravity(Gravity.TOP);
+        imagePrompts.setMinLines(4);
+        imagePrompts.setTextSize(14);
+        r.addView(imagePrompts, new LinearLayout.LayoutParams(-1, -2));
 
         LinearLayout opts = new LinearLayout(this);
         subsCb = new CheckBox(this);
@@ -188,6 +199,14 @@ public class MainActivity extends Activity {
         r.addView(bar);
         status = tv("Ready.", 15, Color.DKGRAY);
         r.addView(status);
+        copyBtn = btn("COPY TITLE, DESCRIPTION & TAGS");
+        copyBtn.setVisibility(View.GONE);
+        copyBtn.setOnClickListener(v -> {
+            ClipboardManager cm = (ClipboardManager) getSystemService(CLIPBOARD_SERVICE);
+            cm.setPrimaryClip(ClipData.newPlainText("YouTube info", result.getText()));
+            toast("Copied");
+        });
+        r.addView(copyBtn);
         openBtn = btn("PLAY VIDEO");
         openBtn.setVisibility(View.GONE);
         openBtn.setOnClickListener(v -> {
@@ -230,6 +249,7 @@ public class MainActivity extends Activity {
             create.setEnabled(true);
             bar.setVisibility(ok ? View.GONE : View.VISIBLE);
             openBtn.setVisibility(ok && savedUri != null ? View.VISIBLE : View.GONE);
+            copyBtn.setVisibility(ok && extra != null && !extra.isEmpty() ? View.VISIBLE : View.GONE);
         });
     }
 
@@ -256,7 +276,7 @@ public class MainActivity extends Activity {
             in = new JSONObject().put("voice_engine", VOICE_ENGINE[v]).put("voice", VOICE_NAME[v])
                     .put("visuals", VIS_VALUE[visSp.getSelectedItemPosition()])
                     .put("style", vintageCb.isChecked() ? "vintage" : "clean").put("subtitles", subsCb.isChecked() ? "true" : "false")
-                    .put("script", s);
+                    .put("script", s).put("image_prompts", imagePrompts.getText().toString().trim());
         } catch (Exception e) {
             toast("Could not prepare request");
             return;
@@ -266,6 +286,7 @@ public class MainActivity extends Activity {
         savedUri = null;
         result.setText("");
         openBtn.setVisibility(View.GONE);
+        copyBtn.setVisibility(View.GONE);
         setStatus("Sending script to the cloud studio...", 3);
         startThread(jobId, in);
     }
@@ -323,27 +344,37 @@ public class MainActivity extends Activity {
             // 3) download the finished MP4 (+ credits)
             setStatus("Downloading your video...", 92);
             JSONObject rel = new JSONObject(gh("GET", "/repos/" + repo + "/releases/tags/video-" + jobId, null));
-            String videoUrl = null, credUrl = null;
+            String videoUrl = null, credUrl = null, metaUrl = null;
             JSONArray assets = rel.getJSONArray("assets");
             for (int i = 0; i < assets.length(); i++) {
                 JSONObject a = assets.getJSONObject(i);
                 if ("final.mp4".equals(a.getString("name"))) videoUrl = a.getString("url");
                 if ("credits.txt".equals(a.getString("name"))) credUrl = a.getString("url");
+                if ("youtube_metadata.txt".equals(a.getString("name"))) metaUrl = a.getString("url");
             }
             if (videoUrl == null) throw new IllegalStateException("Finished, but final.mp4 was not found in the release.");
             String where = saveVideo("OldBritishCars_" + jobId + ".mp4", videoUrl);
-            String credits = "";
+            String extra = "";
+            if (metaUrl != null) {
+                try {
+                    ByteArrayOutputStream bo = new ByteArrayOutputStream();
+                    download(metaUrl, bo, 0);
+                    extra = new String(bo.toByteArray(), StandardCharsets.UTF_8) + "\n\n";
+                } catch (Exception ignore) {
+                    // metadata is optional
+                }
+            }
             if (credUrl != null) {
                 try {
                     ByteArrayOutputStream bo = new ByteArrayOutputStream();
                     download(credUrl, bo, 0);
-                    credits = new String(bo.toByteArray(), StandardCharsets.UTF_8);
+                    extra += new String(bo.toByteArray(), StandardCharsets.UTF_8);
                 } catch (Exception ignore) {
                     // credits are optional
                 }
             }
             prefs.edit().remove("job").apply();
-            endJob(true, "Video ready - 1080p MP4 saved:\n" + where, credits);
+            endJob(true, "Video ready - 1080p MP4 saved:\n" + where, extra);
         } catch (Exception e) {
             String m = e.getMessage() == null ? e.toString() : e.getMessage();
             // keep the pending job (so reopening the app resumes it) only for plain network hiccups

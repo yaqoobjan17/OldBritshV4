@@ -16,7 +16,6 @@ import requests
 W, H, FPS = 1920, 1080, 30
 LEAD, TAIL = 0.12, 0.30          # silence before / after narration in each sentence-scene
 UA = "OldBritishCarsVideoBot/1.0 (personal YouTube documentary project)"
-SFX_KINDS = {"engine", "road", "factory", "none"}
 def log(m): print(m, flush=True)
 
 
@@ -59,11 +58,10 @@ def qtokens(q): return [stem(w) for w in re.findall(r"[a-z0-9]+", q.lower()) if 
 
 
 def relevant(hay, query):
-    """Strict check: does the candidate's title/description really talk about what the sentence needs?"""
+    """Strict check: does the candidate's title/description really talk about what the sentence needs? (niche-agnostic)"""
     toks = qtokens(query)
     if not toks: return False
     hs = {stem(w) for w in re.findall(r"[a-z0-9]+", hay.lower())}
-    if not any(stem(c) in hs for c in CARWORDS): return False     # channel topic = cars: a car word must be in the text
     hits = sum(1 for t in toks if t in hs)
     return hits >= (len(toks) if len(toks) <= 2 else max(2, math.ceil(len(toks) * 0.6)))
 
@@ -96,15 +94,7 @@ def guess_topic(script):
     from collections import Counter
     cnt = Counter(w.lower() for w in re.findall(r"[A-Za-z][A-Za-z\-]{3,}", script) if w.lower() not in STOPW and w.lower() not in GENERIC_Q)
     top = [w for w, c in cnt.most_common(3) if c >= 2]
-    return ("British " + " ".join(top[:2]) + " vintage cars") if top else "vintage British cars"
-
-
-def guess_sfx(text, i):
-    t = text.lower()
-    if re.search(r"\b(engines?|horsepower|rac(?:e|es|ing)|speed|motors?|v8|v12|cylinders?|revs?|chase|siren|sirens)\b", t): return "engine"
-    if re.search(r"\b(factory|plant|assembly|production|workers|workshop)\b", t): return "factory"
-    if re.search(r"\b(drive|drives|driving|road|roads|journey|highway|motorway|motorways|travel|street|streets)\b", t): return "road"
-    return "none"
+    return " ".join(top[:3]) if top else ""
 
 
 def split_long(s, maxw=24):
@@ -140,7 +130,7 @@ def split_units(script):
 
 def heuristic_scene(u, i, topic):
     return dict(narration=u, search_query=extract_query(u) or keywords(u, 3),
-                image_prompt=f"{topic}: a vintage British car scene illustrating - {u}", sfx=guess_sfx(u, i))
+                image_prompt=f"A scene that illustrates: {u}" + (f" (context: {topic})" if topic else ""))
 
 
 GEMINI_MODELS = ["gemini-3.8-flash", "gemini-3.5-flash-lite", "gemini-flash-latest", "gemini-2.5-flash"]
@@ -172,22 +162,22 @@ def gemini_call(body, key):
 def gemini_annotate(units, key):
     numbered = "\n".join(f"{i + 1}. {u}" for i, u in enumerate(units))
     prompt = (
-        "You are the art director of a cinematic YouTube documentary about old British cars. The narration is split into "
-        "numbered sentences. For EVERY sentence design ONE striking image.\n"
-        'Return JSON only: {"topic":"<4-8 words: overall subject and era>",'
-        '"style":"<ONE reusable visual style line for ALL images: film stock, colour palette, light, era, mood>",'
-        '"scenes":[{"i":1,"search_query":"<2-5 English words for a photo search: the specific car model, marque or place in THIS '
-        'sentence; include the word car when a car is the subject>",'
-        '"image_prompt":"<one vivid sentence, 25-45 words, describing exactly what the camera sees: the specific vehicle (marque, '
-        'model, colour, era), the setting, camera angle/shot type and light. No text, no readable number plates, no logos, no '
-        'recognisable real people.>","sfx":"engine|road|factory|none"}]}\n'
+        "You are the art director of a cinematic YouTube documentary/explainer video. The narration is split into "
+        "numbered sentences, on ANY topic. For EVERY sentence design ONE striking, on-topic image.\n"
+        'Return JSON only: {"topic":"<4-8 words: what this video is actually about>",'
+        '"style":"<ONE reusable visual style line for ALL images: film stock, colour palette, light, era, mood - fitting '
+        'this specific topic>",'
+        '"scenes":[{"i":1,"search_query":"<2-5 English words for a real photo search: the specific subject, person, place '
+        'or object named or implied by THIS sentence>",'
+        '"image_prompt":"<one vivid sentence, 25-45 words, describing exactly what the camera sees for THIS sentence: '
+        'subject, setting, camera angle/shot type and light. No text, no readable signage, no logos, no recognisable real '
+        'people.>","sfx":"none"}]}\n'
         "Rules:\n"
-        "- exactly one entry per sentence, same numbering; be historically accurate; never invent facts.\n"
-        "- EVERY image must feature a vintage British car or a period automotive scene (street, garage, factory, showroom, "
-        "police station, motorway). For abstract or figurative sentences, show a concrete car scene that fits the mood - never a "
-        "literal object such as fruit, insects, animals or drawings.\n"
-        "- vary the shots: wide establishing, low-angle hero shot, close-up of grille/badge/headlamp/dashboard, interior, "
-        "motion on the road, rear three-quarter, night with headlights.\n\nSENTENCES:\n" + numbered)
+        "- exactly one entry per sentence, same numbering; be accurate to the sentence; never invent facts.\n"
+        "- every image must be concretely on-topic for what that sentence literally says - never a generic stock filler "
+        "unrelated to the sentence's subject.\n"
+        "- vary the shots across the video: wide establishing, close-up/detail, low or high angle, action/motion, interior, "
+        "night/low light - whatever fits each sentence.\n\nSENTENCES:\n" + numbered)
     body = {"contents": [{"parts": [{"text": prompt}]}],
             "generationConfig": {"responseMimeType": "application/json", "temperature": 0.5}}
     data = json.loads(gemini_call(body, key))
@@ -217,13 +207,23 @@ def stage_plan(a, st):
     scenes = []
     for i, u in enumerate(units):
         h, n = heuristic_scene(u, i, topic), notes[i] or {}
-        sfx = n.get("sfx", h["sfx"])
         scenes.append(dict(i=i, narration=u, search_query=str(n.get("search_query") or h["search_query"]).strip(),
-                           image_prompt=str(n.get("image_prompt") or h["image_prompt"]).strip(), sfx=sfx if sfx in SFX_KINDS else "none"))
-    for i, sc in enumerate(scenes):       # smooth ambient sound so it does not flip every sentence
-        w = [scenes[j]["sfx"] for j in (i - 1, i, i + 1) if 0 <= j < len(scenes)]
-        sc["sfx_final"] = max(set(w), key=lambda k: (w.count(k), k == sc["sfx"]))
+                           image_prompt=str(n.get("image_prompt") or h["image_prompt"]).strip()))
     if a.max_scenes: scenes = scenes[:a.max_scenes]
+    prompts_file = Path(a.work) / "image_prompts.txt"
+    if prompts_file.exists():
+        lines = [ln.strip() for ln in prompts_file.read_text(encoding="utf-8").splitlines() if ln.strip()]
+        if lines:
+            n = min(len(lines), len(scenes))
+            for i in range(n):
+                scenes[i]["search_query"], scenes[i]["image_prompt"] = lines[i][:80], lines[i]
+                scenes[i]["user_prompt"] = True
+            log(f"Using {n} user-supplied image prompts" + (f" ({len(lines)} given, {len(scenes)} sentences - "
+                f"{'extra ignored' if len(lines) > len(scenes) else 'rest auto-generated'})" if len(lines) != len(scenes) else ""))
+            if len(lines) != len(scenes):
+                st["warnings"].append(f"You pasted {len(lines)} image prompts but the script has {len(scenes)} sentences - "
+                                      f"{'the extra prompts were ignored' if len(lines) > len(scenes) else 'the remaining sentences used automatic prompts'}. "
+                                      f"For 1 prompt per sentence exactly, match the count.")
     st["scenes"], st["topic"], st["style"] = scenes, topic, style
     log(f"{len(scenes)} sentence-scenes. Topic: {topic}")
 
@@ -344,8 +344,8 @@ def pexels(query, path_base, used, credits, want_video):
     return None
 
 
-AI_STYLE = ("cinematic 35mm film photograph, vintage British cars, muted natural colours, soft overcast light, shallow depth of field, "
-            "highly detailed, professional automotive photography, no text, no captions, no logos, no watermark")
+AI_STYLE = ("cinematic 35mm film photograph, natural colours, soft realistic light, shallow depth of field, "
+            "highly detailed, professional photography, no text, no captions, no logos, no watermark")
 _ai = {"last": 0.0, "fails": 0}
 
 
@@ -477,13 +477,6 @@ def write_ass(scene, path):
     Path(path).write_text("".join(lines), encoding="utf-8")
 
 
-def sfx_source(kind, D):
-    if kind == "engine": return f"anoisesrc=color=brown:amplitude=1.0:duration={D:.2f}:sample_rate=44100", "lowpass=f=170,tremolo=f=9:d=0.55", 0.30
-    if kind == "road": return f"anoisesrc=color=pink:amplitude=1.0:duration={D:.2f}:sample_rate=44100", "bandpass=f=700:width_type=h:w=900,tremolo=f=3:d=0.3", 0.16
-    if kind == "factory": return f"anoisesrc=color=pink:amplitude=1.0:duration={D:.2f}:sample_rate=44100", "lowpass=f=900,tremolo=f=4.5:d=0.9", 0.14
-    return None
-
-
 def motion(i, N):
     return [("1+0.12*on/%d" % N, "iw/2-(iw/zoom/2)", "ih/2-(ih/zoom/2)"),
             ("1.12-0.12*on/%d" % N, "iw/2-(iw/zoom/2)", "ih/2-(ih/zoom/2)"),
@@ -491,13 +484,27 @@ def motion(i, N):
             ("1.10", "(iw-iw/zoom)*(1-on/%d)" % N, "(ih-ih/zoom)/2")][i % 4]
 
 
+def ensure_grain_tile(work):
+    tile = work / "grain_tile.png"
+    if not tile.exists():
+        run(["ffmpeg", "-y", "-f", "lavfi", "-i", "nullsrc=s=256x256:d=1", "-vf", "geq=random(1)*255:128:128", "-frames:v", "1", tile.name], cwd=work)
+    return tile
+
+
 def render_segment(s, work, D, style, subs):
+    """Renders one sentence's clip. No per-segment fades or synthetic sound effects here - the whole
+    video is stitched together afterwards with real crossfade dissolves (see stage_render), and the
+    only audio is the clean narration (no ambient noise bed - that was the source of the 'noise' under
+    the voice in earlier versions)."""
     i, kind = s["i"], s["visual_kind"]
     seg = f"seg_{i:03d}.mkv"
     cmd = ["ffmpeg", "-y"]
     cmd += ["-i", s["visual_file"]] if kind == "image" else ["-stream_loop", "-1", "-i", s["visual_file"]]
     cmd += ["-i", s["voice_file"]]
-    fc, mix = [], ["[va]"]
+    grain_idx = None
+    if style == "vintage":
+        cmd += ["-loop", "1", "-i", "grain_tile.png"]; grain_idx = 2
+    fc = []
     if kind == "image":
         N = int(D * FPS) + 2; z, x, y = motion(i, N)
         pre = "crop=iw:ih*0.93:0:0," if (s.get("wm") and not os.getenv("POLLINATIONS_API_KEY", "").strip()) else ""
@@ -506,31 +513,43 @@ def render_segment(s, work, D, style, subs):
     else:
         fc.append(f"[0:v]scale={W}:{H}:force_original_aspect_ratio=increase,crop={W}:{H},setsar=1,fps={FPS}[v0]")
     if style == "vintage":
-        fc.append("[v0]eq=contrast=1.06:saturation=0.88:brightness=-0.02,curves=r='0/0.03 1/0.98':b='0/0.05 1/0.88',"
-                  "vignette=angle=PI/5[v1]")
+        fc.append("[v0]eq=contrast=1.06:saturation=0.88:brightness=-0.02,curves=r='0/0.03 1/0.98':b='0/0.05 1/0.88'[vg]")
+        fc.append(f"[{grain_idx}:v]scale={W}:{H}:flags=neighbor[gr]")
+        fc.append("[vg][gr]blend=all_mode=screen:all_opacity=0.045[vg2]")
+        fc.append("[vg2]vignette=angle=PI/5[v1]")
     else:
         fc.append("[v0]null[v1]")
-    fc.append(f"[v1]fade=t=in:st=0:d=0.12,fade=t=out:st={D - 0.12:.2f}:d=0.12[v2]")
-    fc.append(f"[v2]ass=s_{i:03d}.ass[vout]" if subs else "[v2]null[vout]")
-    fc.append(f"[1:a]aresample=44100,aformat=channel_layouts=stereo,adelay={int(LEAD * 1000)}:all=1,apad=whole_dur={D:.2f}[va]")
-    k = 2
-    src = sfx_source(s.get("sfx_final", s["sfx"]), D)
-    if src:
-        cmd += ["-f", "lavfi", "-i", src[0]]
-        fc.append(f"[{k}:a]{src[1]},aformat=channel_layouts=stereo,volume={src[2]},afade=t=in:d=0.08,afade=t=out:st={D - 0.08:.2f}:d=0.08[sa]")
-        mix.append("[sa]"); k += 1
-    if i > 0 and i % 4 == 0:  # occasional whoosh accent
-        cmd += ["-f", "lavfi", "-i", "anoisesrc=color=white:amplitude=1.0:duration=0.9:sample_rate=44100"]
-        fc.append(f"[{k}:a]highpass=f=400,lowpass=f=5000,aformat=channel_layouts=stereo,afade=t=in:d=0.35,"
-                  f"afade=t=out:st=0.35:d=0.5,volume=0.12,apad=whole_dur={D:.2f}[wh]")
-        mix.append("[wh]"); k += 1
-    fc.append("".join(mix) + f"amix=inputs={len(mix)}:duration=first:normalize=0[aout]")
+    fc.append(f"[v1]ass=s_{i:03d}.ass[vout]" if subs else "[v1]null[vout]")
+    fc.append(f"[1:a]aresample=44100,aformat=channel_layouts=stereo,adelay={int(LEAD * 1000)}:all=1,apad=whole_dur={D:.2f}[aout]")
     cmd += ["-filter_complex", ";".join(fc), "-map", "[vout]", "-map", "[aout]", "-t", f"{D:.2f}",
             "-c:v", "libx264", "-preset", "veryfast", "-crf", "19", "-maxrate", "12M", "-bufsize", "24M",
             "-pix_fmt", "yuv420p", "-r", str(FPS),
             "-c:a", "pcm_s16le", seg]
     run(cmd, cwd=work)
     return seg
+
+
+def crossfade_merge(work, segs, durs, xfade_dur=0.35):
+    """Stitches the per-sentence clips into one stream with a real dissolve at every image change
+    (instead of a hard cut), so the change from one sentence's picture to the next is always visible."""
+    if len(segs) == 1:
+        return segs[0]
+    cmd = ["ffmpeg", "-y"]
+    for sgm in segs: cmd += ["-i", sgm]
+    vfc, afc, cur_v, cur_a, acc = [], [], "0:v", "0:a", durs[0]
+    for i in range(1, len(segs)):
+        T = max(0.08, min(xfade_dur, 0.4 * durs[i - 1], 0.4 * durs[i]))
+        vfc.append(f"[{cur_v}][{i}:v]xfade=transition=fade:duration={T:.3f}:offset={acc - T:.3f}[v{i}]")
+        afc.append(f"[{cur_a}][{i}:a]acrossfade=d={T:.3f}:c1=tri:c2=tri[a{i}]")
+        cur_v, cur_a, acc = f"v{i}", f"a{i}", acc + durs[i] - T
+    fc = vfc + afc
+    fc.append(f"[{cur_v}]fade=t=in:st=0:d=0.3,fade=t=out:st={acc - 0.3:.2f}:d=0.3[vout]")
+    out = "merged.mkv"
+    cmd += ["-filter_complex", ";".join(fc), "-map", "[vout]", "-map", f"[{cur_a}]",
+            "-c:v", "libx264", "-preset", "veryfast", "-crf", "19", "-maxrate", "12M", "-bufsize", "24M",
+            "-pix_fmt", "yuv420p", "-r", str(FPS), "-c:a", "pcm_s16le", out]
+    run(cmd, cwd=work)
+    return out
 
 
 def stage_render(a, st):
@@ -540,19 +559,23 @@ def stage_render(a, st):
     for s in st["scenes"]:
         s["dur"] = max(2.0, s["voice_dur"] + LEAD + TAIL)
         if a.subtitles: write_ass(s, work / f"s_{s['i']:03d}.ass")
+    if a.style == "vintage": ensure_grain_tile(work)
     workers = max(1, min(3, (os.cpu_count() or 1) // 2 or 1))
     log(f"  rendering {total} scenes with {workers} parallel worker(s)")
     def job(s):
         seg = render_segment(s, work, s["dur"], a.style, a.subtitles); log(f"  rendered scene {s['i'] + 1}/{total}"); return seg
     with ThreadPoolExecutor(workers) as ex: segs = list(ex.map(job, st["scenes"]))
-    offset, srt, n = 0.0, [], 1
+    srt, n, offset = [], 1, 0.0
     for s in st["scenes"]:
         for c0, c1, c in chunks_for(s):
             srt.append(f"{n}\n{ts_srt(offset + c0)} --> {ts_srt(offset + c1)}\n{c}\n"); n += 1
         offset += s["dur"]
-    (work / "list.txt").write_text("".join(f"file '{x}'\n" for x in segs))
+    durs = [s["dur"] for s in st["scenes"]]
+    log("  stitching with crossfade dissolves...")
+    merged = crossfade_merge(work, segs, durs)
+    offset = sum(durs) - sum(max(0.08, min(0.35, 0.4 * durs[i - 1], 0.4 * durs[i])) for i in range(1, len(durs)))
     music = next((p for p in (os.getenv("MUSIC_FILE", ""), "assets/music.mp3") if p and os.path.exists(p)), None)
-    cmd = ["ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", "list.txt"]
+    cmd = ["ffmpeg", "-y", "-i", merged]
     if music:
         cmd += ["-stream_loop", "-1", "-i", os.path.abspath(music)]
         af = (f"[1:a]atrim=0:{offset:.2f},volume=0.22,aformat=channel_layouts=stereo[m];[0:a]asplit=2[va][vs];"
@@ -574,10 +597,47 @@ def stage_render(a, st):
     log(f"DONE: {final}  {info}  {probe_dur(final):.1f}s  {final.stat().st_size / 1e6:.1f} MB")
 
 
+# ----------------------------------------------------------------- METADATA
+def stage_metadata(a, st):
+    out = Path(a.out); out.mkdir(parents=True, exist_ok=True)
+    script = " ".join(sc["narration"] for sc in st["scenes"])
+    key = os.getenv("GEMINI_API_KEY", "").strip()
+    data = None
+    if key and not a.offline:
+        prompt = (
+            "You are a YouTube SEO strategist. Based on this video's narration, write "
+            'metadata. Return JSON only: {"titles":["<title 1, under 70 chars, curiosity-driven>","<title 2, different angle>",'
+            '"<title 3, different angle>"],"description":"<2-3 paragraph YouTube description: a hook, then what the video '
+            'covers, ending with a subscribe line. Plain text, no markdown.>","hashtags":["#tag", ...8 to 12 short hashtags...],'
+            '"keywords":["keyword phrase", ...12 to 18 SEO search phrases a viewer might type, comma-style, no # symbol...]}\n'
+            "Rules: titles must be honest to the content (no clickbait that misleads), no ALL CAPS, no emoji spam (max 1 emoji "
+            "per title). Topic: " + (st.get("topic") or "see narration below") + "\n\nNARRATION:\n" + script[:6000])
+        body = {"contents": [{"parts": [{"text": prompt}]}], "generationConfig": {"responseMimeType": "application/json", "temperature": 0.7}}
+        try:
+            data = json.loads(gemini_call(body, key))
+        except Exception as e:
+            log("METADATA FAILED:\n" + "\n".join(textwrap.wrap(str(e).replace(" || ", "\n"), 60, replace_whitespace=False)))
+            st["warnings"].append("SEO metadata generation failed, wrote a basic fallback instead (see 'METADATA FAILED' above)")
+    if not data:
+        base = (st.get("topic") or "This Video").strip()
+        data = {"titles": [f"{base} - The Full Story", f"What You Didn't Know About {base}", f"{base}: Explained"],
+                "description": f"A closer look at {base.lower()}. Subscribe for more.",
+                "hashtags": ["#shorts" if False else "#video", "#documentary", "#explainer"],
+                "keywords": [base.lower()] if base else []}
+    lines = ["=== TITLES (pick one) ===", ""]
+    lines += [f"{i + 1}. {t}" for i, t in enumerate(data.get("titles", []))]
+    lines += ["", "=== DESCRIPTION ===", "", data.get("description", ""),
+              "", "=== HASHTAGS ===", "", " ".join(data.get("hashtags", [])),
+              "", "=== SEO KEYWORDS (comma-separated, paste into YouTube 'Tags') ===", "", ", ".join(data.get("keywords", []))]
+    (out / "youtube_metadata.txt").write_text("\n".join(lines), encoding="utf-8")
+    (out / "youtube_metadata.json").write_text(json.dumps(data, indent=1, ensure_ascii=False), encoding="utf-8")
+    log("Wrote youtube_metadata.txt")
+
+
 # ----------------------------------------------------------------- MAIN
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--stage", default="all", choices=["all", "plan", "voice", "visuals", "render"])
+    ap.add_argument("--stage", default="all", choices=["all", "plan", "voice", "visuals", "render", "metadata"])
     ap.add_argument("--script", default="work/script.txt"); ap.add_argument("--work", default="work"); ap.add_argument("--out", default="out")
     ap.add_argument("--voice", default="en-GB-RyanNeural"); ap.add_argument("--voice-engine", default="auto", choices=["auto", "edge", "eleven"])
     ap.add_argument("--style", default="vintage", choices=["vintage", "clean"])
@@ -588,10 +648,10 @@ def main():
     Path(a.work).mkdir(parents=True, exist_ok=True)
     sp = Path(a.work) / "state.json"
     st = json.loads(sp.read_text()) if sp.exists() else {"scenes": [], "warnings": [], "credits": []}
-    stages = {"plan": stage_plan, "voice": stage_voice, "visuals": stage_visuals, "render": stage_render}
+    stages = {"plan": stage_plan, "voice": stage_voice, "visuals": stage_visuals, "render": stage_render, "metadata": stage_metadata}
     for name in (stages if a.stage == "all" else [a.stage]):
         log(f"== {name} =="); t = time.time()
-        if name != "plan" and not st["scenes"]: raise SystemExit("Run the plan stage first")
+        if name not in ("plan",) and not st["scenes"]: raise SystemExit("Run the plan stage first")
         stages[name](a, st); sp.write_text(json.dumps(st, ensure_ascii=False, indent=1)); log(f"   ({time.time() - t:.0f}s)")
     if st["warnings"]: log("WARNINGS:\n - " + "\n - ".join(st["warnings"]))
 
