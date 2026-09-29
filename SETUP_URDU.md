@@ -22,6 +22,13 @@ Script sentence-by-sentence toot-ti hai. Har sentence ki apni image hoti hai jo 
 App me 3 modes: **Auto** (asli photo tab jab wo sentence se sach me match kare, warna AI image), **AI har sentence ke liye**, **Real photos only**.
 **GEMINI_API_KEY zaroor daalo** (free): wo har sentence ke liye sahi search words aur image description likhta hai, is se matching bohat behtar hoti hai.
 
+## V11: Kinetic captions + number/fact stat-cards
+Subtitles ab simple safed text nahi, **kinetic style** hain: har phrase halka sa 'pop' karke aata hai, aur us phrase ka khaas lafz (number ya khaas naam) sunehri rang me highlight hota hai.
+
+Agar sentence me koi number/fact ho (jaise '150 mph', '\$499,902', '1965', '220 hp'), to wo apne aap ek **bara animated stat-card** ban kar beech screen par pop hota hai — bilkul us reference video jaisa asar, lekin humari HD car photo ke oper.
+
+Kuch bhi extra setup nahi karna, ye khud kaam karta hai. Bas Unpack chalana hai.
+
 ## V10: Kisi bhi niche ke liye + aapke apne image prompts + asli crossfade
 Ab app kisi bhi topic ki script ke liye kaam karta hai (cars, kahani, cooking, tareekh — kuch bhi).
 

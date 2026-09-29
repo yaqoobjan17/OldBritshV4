@@ -453,6 +453,8 @@ def chunks_for(scene):
     return out
 
 
+ACCENT = "&H2FC7FF&"   # ASS colour (BGR): a warm gold/amber accent for highlighted words and stat cards
+
 ASS_HEAD = f"""[Script Info]
 ScriptType: v4.00+
 PlayResX: {W}
@@ -463,17 +465,56 @@ ScaledBorderAndShadow: yes
 [V4+ Styles]
 Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
 Style: Default,DejaVu Sans,56,&H00FFFFFF,&H000000FF,&H00000000,&H90000000,-1,0,0,0,100,100,0,0,1,4,2,2,140,140,85,1
+Style: Stat,DejaVu Sans,96,&H00FFFFFF,&H000000FF,&H00302000,&HD0201004,-1,0,0,0,100,100,0,0,3,0,10,5,80,80,60,1
 
 [Events]
 Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
 """
 
+# ordered: currency, then number+unit, then a bare year, then any other longish number
+STAT_PATTERNS = [
+    re.compile(r"\$\s?\d[\d,]*(?:\.\d+)?"),
+    re.compile(r"\b\d[\d,]*(?:\.\d+)?\s?(?:mph|km/h|kmh|hp|bhp|cc|kg|lbs?|miles?|mm|cm|litres?|liters?|seconds?|secs?|years?|hours?)\b", re.I),
+    re.compile(r"\b(1[6-9]\d{2}|20\d{2})\b"),
+    re.compile(r"\b\d{1,3}(?:,\d{3})+\b|\b\d{3,}\b"),
+]
+
+
+def find_stat(text):
+    """First eye-catching number/fact in a sentence (money, a spec with a unit, a year, or a big number)."""
+    for pat in STAT_PATTERNS:
+        m = pat.search(text)
+        if m: return m.group(0).strip()
+    return None
+
+
+def highlight(chunk_text):
+    """Wraps the most eye-catching word/number in a chunk with the accent colour for a kinetic-caption look."""
+    for pat in STAT_PATTERNS:
+        m = pat.search(chunk_text)
+        if m:
+            return chunk_text[:m.start()] + "{\\c" + ACCENT + "}" + m.group(0) + "{\\c&HFFFFFF&}" + chunk_text[m.end():]
+    m = re.search(r"(?<!^)(?<=\s)[A-Z][a-zA-Z'\-]{2,}", chunk_text)
+    if m:
+        return chunk_text[:m.start()] + "{\\c" + ACCENT + "}" + m.group(0) + "{\\c&HFFFFFF&}" + chunk_text[m.end():]
+    return chunk_text
+
 
 def write_ass(scene, path):
     lines = [ASS_HEAD]
-    for a, b, c in chunks_for(scene):
+    chunks = chunks_for(scene)
+    for a, b, c in chunks:
         c = c.replace("{", "(").replace("}", ")")
-        lines.append(f"Dialogue: 0,{ts_ass(a)},{ts_ass(b)},Default,,0,0,0,,{{\\fad(120,120)}}{c}\n")
+        pop = "\\t(0,120,\\fscx112\\fscy112)\\t(120,220,\\fscx100\\fscy100)"
+        lines.append(f"Dialogue: 0,{ts_ass(a)},{ts_ass(b)},Default,,0,0,0,,{{\\fad(120,120){pop}}}{highlight(c)}\n")
+    stat = find_stat(scene["narration"])
+    if stat:
+        hit = next(((a, b) for a, b, c in chunks if stat.lower() in c.lower()), None)
+        if hit:
+            a, b = hit
+            b = max(b, a + 1.6); b = min(b + 0.4, scene["voice_dur"] + LEAD + 0.2)
+            pop = "\\t(0,200,\\fscx122\\fscy122)\\t(200,380,\\fscx100\\fscy100)"
+            lines.append(f"Dialogue: 1,{ts_ass(a)},{ts_ass(b)},Stat,,0,0,0,,{{\\fad(150,200){pop}}}{stat}\n")
     Path(path).write_text("".join(lines), encoding="utf-8")
 
 
