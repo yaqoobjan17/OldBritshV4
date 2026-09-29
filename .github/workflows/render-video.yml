@@ -11,6 +11,7 @@ on:
       style:        { description: "vintage | clean",          required: false, type: string, default: "vintage" }
       subtitles:    { description: "true | false",             required: false, type: string, default: "true" }
       visuals:      { description: "auto | ai | real",         required: false, type: string, default: "auto" }
+      image_prompts: { description: "Optional: one image prompt per line, one per sentence", required: false, type: string, default: "" }
 
 permissions:
   contents: write
@@ -31,6 +32,7 @@ jobs:
       STYLE:        ${{ inputs.style }}
       SUBS:         ${{ inputs.subtitles }}
       VISUALS:      ${{ inputs.visuals }}
+      IMAGE_PROMPTS: ${{ inputs.image_prompts }}
     steps:
       - uses: actions/checkout@v4
 
@@ -41,6 +43,7 @@ jobs:
           pip install requests edge-tts
           mkdir -p work out
           printf '%s' "$SCRIPT_TEXT" > work/script.txt
+          printf '%s' "$IMAGE_PROMPTS" > work/image_prompts.txt
 
       - name: "1/4 Plan scenes"
         run: python pipeline/make_video.py --stage plan
@@ -54,12 +57,15 @@ jobs:
       - name: "4/4 Render 1080p video"
         run: python pipeline/make_video.py --stage render --style "$STYLE" --subtitles "$SUBS"
 
+      - name: "5/5 Write titles, description, hashtags"
+        run: python pipeline/make_video.py --stage metadata
+
       - name: Publish video
         env:
           GH_TOKEN: ${{ github.token }}
           JOB: ${{ inputs.job_id }}
         run: |
-          gh release create "video-$JOB" out/final.mp4 out/credits.txt out/subtitles.srt out/scene_plan.json \
+          gh release create "video-$JOB" out/final.mp4 out/credits.txt out/subtitles.srt out/scene_plan.json out/youtube_metadata.txt \
             --title "Video $JOB" --notes "Rendered automatically." --target "$GITHUB_SHA"
           # keep only the 8 newest videos so storage stays small
           gh release list --limit 100 --json tagName --jq '.[].tagName' | grep '^video-' | tail -n +9 \
