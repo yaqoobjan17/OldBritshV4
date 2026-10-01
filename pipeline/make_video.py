@@ -9,6 +9,7 @@ Stages (each reads/writes work/state.json):
   render  Ken-Burns animation, vintage grade, SFX, subtitles -> final.mp4 (1920x1080)
 """
 import argparse, asyncio, html, json, math, os, re, subprocess, sys, textwrap, time
+from concurrent.futures import ThreadPoolExecutor
 from urllib.parse import quote
 from pathlib import Path
 import requests
@@ -207,23 +208,29 @@ def stage_plan(a, st):
     scenes = []
     for i, u in enumerate(units):
         h, n = heuristic_scene(u, i, topic), notes[i] or {}
-        scenes.append(dict(i=i, narration=u, search_query=str(n.get("search_query") or h["search_query"]).strip(),
-                           image_prompt=str(n.get("image_prompt") or h["image_prompt"]).strip()))
+        q = str(n.get("search_query") or h["search_query"]).strip()
+        p = str(n.get("image_prompt") or h["image_prompt"]).strip()
+        scenes.append(dict(i=i, narration=u, prompts=[dict(query=q, prompt=p)]))
     if a.max_scenes: scenes = scenes[:a.max_scenes]
     prompts_file = Path(a.work) / "image_prompts.txt"
     if prompts_file.exists():
-        lines = [ln.strip() for ln in prompts_file.read_text(encoding="utf-8").splitlines() if ln.strip()]
-        if lines:
-            n = min(len(lines), len(scenes))
+        raw_lines = [ln.strip() for ln in prompts_file.read_text(encoding="utf-8").splitlines() if ln.strip()]
+        if raw_lines:
+            n = min(len(raw_lines), len(scenes))
+            total_imgs = 0
             for i in range(n):
-                scenes[i]["search_query"], scenes[i]["image_prompt"] = lines[i][:80], lines[i]
+                line = re.sub(r"^[^:]{0,60}:\s*", "", raw_lines[i])   # drop a leading label like "Sentence 3 image keywords:"
+                parts = [x.strip() for x in line.split(",") if x.strip()] or [line]
+                scenes[i]["prompts"] = [dict(query=x[:80], prompt=x) for x in parts]
                 scenes[i]["user_prompt"] = True
-            log(f"Using {n} user-supplied image prompts" + (f" ({len(lines)} given, {len(scenes)} sentences - "
-                f"{'extra ignored' if len(lines) > len(scenes) else 'rest auto-generated'})" if len(lines) != len(scenes) else ""))
-            if len(lines) != len(scenes):
-                st["warnings"].append(f"You pasted {len(lines)} image prompts but the script has {len(scenes)} sentences - "
-                                      f"{'the extra prompts were ignored' if len(lines) > len(scenes) else 'the remaining sentences used automatic prompts'}. "
-                                      f"For 1 prompt per sentence exactly, match the count.")
+                total_imgs += len(parts)
+            log(f"Using {n} user-supplied sentence(s), {total_imgs} image keyword(s) total" +
+                (f" ({len(raw_lines)} lines given, {len(scenes)} sentences - "
+                 f"{'extra ignored' if len(raw_lines) > len(scenes) else 'rest auto-generated'})" if len(raw_lines) != len(scenes) else ""))
+            if len(raw_lines) != len(scenes):
+                st["warnings"].append(f"You pasted {len(raw_lines)} image-prompt lines but the script has {len(scenes)} sentences - "
+                                      f"{'the extra lines were ignored' if len(raw_lines) > len(scenes) else 'the remaining sentences used automatic prompts'}. "
+                                      f"For exact control, match the line count to the sentence count (commas inside one line = multiple images for that sentence).")
     st["scenes"], st["topic"], st["style"] = scenes, topic, style
     log(f"{len(scenes)} sentence-scenes. Topic: {topic}")
 
@@ -243,6 +250,44 @@ def edge_tts_save(text, out, voice):
     asyncio.run(edge_tts.Communicate(text, voice, rate="-4%").save(str(out)))
 
 
+GEMINI_TTS_MODELS = ["gemini-3.8-flash-tts", "gemini-3.1-flash-tts-preview", "gemini-2.5-flash-preview-tts"]
+
+
+def gemini_tts(text, out, voice="Charon"):
+    """Google AI Studio's own narrator voice (Gemini TTS) - a clear, measured option when ElevenLabs
+    isn't configured. 'Charon' is a calm, deeper default that reads well for an older documentary
+    audience; set GEMINI_TTS_VOICE to try another name from Google AI Studio's voice picker."""
+    key = os.environ["GEMINI_API_KEY"].strip()
+    body = {"contents": [{"parts": [{"text": text}]}],
+            "generationConfig": {"responseModalities": ["AUDIO"],
+                                 "speechConfig": {"voiceConfig": {"prebuiltVoiceConfig": {"voiceName": voice}}}}}
+    errors = []
+    for model in GEMINI_TTS_MODELS:
+        url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
+        try:
+            r = requests.post(url, headers={"x-goog-api-key": key}, json=body, timeout=120)
+        except requests.RequestException as e:
+            errors.append(f"{model}: {type(e).__name__}"); continue
+        if r.status_code != 200:
+            try: msg = r.json()["error"]["message"]
+            except Exception: msg = r.text[:120]
+            errors.append(f"{model}: HTTP {r.status_code} - {re.sub(r'AIza[\w-]+|AQ\.[\w.-]+', '<key>', msg)[:140]}")
+            continue
+        for part in r.json().get("candidates", [{}])[0].get("content", {}).get("parts", []):
+            inline = part.get("inlineData") or part.get("inline_data")
+            if inline and inline.get("data"):
+                import base64
+                rate_m = re.search(r"rate=(\d+)", inline.get("mimeType", inline.get("mime_type", "")) or "")
+                rate = rate_m.group(1) if rate_m else "24000"
+                pcm = Path(str(out) + ".pcm"); pcm.write_bytes(base64.b64decode(inline["data"]))
+                run(["ffmpeg", "-y", "-f", "s16le", "-ar", rate, "-ac", "1", "-i", pcm.name,
+                     "-c:a", "libmp3lame", Path(out).name], cwd=Path(out).parent)
+                pcm.unlink(missing_ok=True)
+                return
+        errors.append(f"{model}: no audio in response")
+    raise RuntimeError(" || ".join(errors))
+
+
 def silent_voice(text, out):
     secs = max(2.0, wc(text) / 2.5)
     run(["ffmpeg", "-y", "-f", "lavfi", "-i", "anullsrc=r=44100:cl=mono", "-t", f"{secs:.2f}", out])
@@ -256,6 +301,7 @@ def stage_voice(a, st):
             if engine == "eleven":
                 k = s["i"]; sc = st["scenes"]
                 eleven_tts(s["narration"], f, sc[k - 1]["narration"] if k else "", sc[k + 1]["narration"] if k + 1 < len(sc) else "")
+            elif engine == "gemini": gemini_tts(s["narration"], f, os.getenv("GEMINI_TTS_VOICE", "Charon").strip() or "Charon")
             elif engine == "edge": edge_tts_save(s["narration"], f, a.voice)
             else: silent_voice(s["narration"], f)
             s["voice_file"], s["voice_dur"] = f.name, probe_dur(f)
@@ -264,6 +310,7 @@ def stage_voice(a, st):
     order = []
     if not a.offline:
         if a.voice_engine in ("auto", "eleven") and os.getenv("ELEVENLABS_API_KEY", "").strip(): order.append("eleven")
+        if a.voice_engine in ("auto", "gemini") and os.getenv("GEMINI_API_KEY", "").strip(): order.append("gemini")
         order.append("edge")
     if a.offline: order.append("silent")
     for eng in order:
@@ -331,7 +378,7 @@ def pexels(query, path_base, used, credits, want_video):
             f = min(files, key=lambda f: abs(f["width"] - 1920))
             path = Path(str(path_base) + ".mp4"); download(f["link"], path); used.add(v["id"])
             credits.append(f"Pexels video by {v.get('user', {}).get('name', '')} - {v.get('url', '')}")
-            return path, "video"
+            return path, "image"
         return None
     r = requests.get("https://api.pexels.com/v1/search", headers=h, timeout=30,
                      params={"query": query, "per_page": 15, "orientation": "landscape"})
@@ -344,13 +391,98 @@ def pexels(query, path_base, used, credits, want_video):
     return None
 
 
+def pixabay(query, path_base, used, credits, want_video):
+    """Free real-photo/video search (pixabay.com/api/docs) - no billing, needs a free PIXABAY_API_KEY."""
+    key = os.getenv("PIXABAY_API_KEY", "").strip()
+    if not key: return None
+    if want_video:
+        r = requests.get("https://pixabay.com/api/videos/", timeout=30,
+                         params={"key": key, "q": query, "per_page": 15, "safesearch": "true"})
+        for v in r.json().get("hits", []):
+            vf = v.get("videos", {}).get("large") or v.get("videos", {}).get("medium")
+            if not vf or v["id"] in used or vf.get("width", 0) < 1280: continue
+            if not relevant(v.get("tags", ""), query): continue
+            path = Path(str(path_base) + ".mp4"); download(vf["url"], path); used.add(v["id"])
+            credits.append(f"Pixabay video by {v.get('user', '')} - https://pixabay.com/videos/id-{v['id']}/")
+            return path, "video"
+        return None
+    r = requests.get("https://pixabay.com/api/", timeout=30,
+                     params={"key": key, "q": query, "per_page": 15, "image_type": "photo",
+                             "orientation": "horizontal", "safesearch": "true", "min_width": 1200})
+    for p in r.json().get("hits", []):
+        if p["id"] in used: continue
+        if not relevant(p.get("tags", ""), query): continue
+        path = Path(str(path_base) + ".jpg"); download(p["largeImageURL"], path); used.add(p["id"])
+        credits.append(f"Pixabay photo by {p.get('user', '')} - https://pixabay.com/photos/id-{p['id']}/")
+        return path, "image"
+    return None
+
+
+def google_cse(query, path_base, used, credits):
+    """Optional real-photo search via Google's official Custom Search API - needs GOOGLE_CSE_KEY + GOOGLE_CSE_ID.
+    Google's free tier is 100 queries/day, then billed - only used when these secrets are actually set."""
+    key, cx = os.getenv("GOOGLE_CSE_KEY", "").strip(), os.getenv("GOOGLE_CSE_ID", "").strip()
+    if not key or not cx: return None
+    r = requests.get("https://www.googleapis.com/customsearch/v1", timeout=30,
+                     params={"key": key, "cx": cx, "q": query, "searchType": "image", "num": 10,
+                             "safe": "active", "imgSize": "large"})
+    data = r.json()
+    if "error" in data: raise RuntimeError(data["error"].get("message", "Google CSE error")[:100])
+    for item in data.get("items", []):
+        link = item.get("link", "")
+        if link in used: continue
+        if not relevant(item.get("title", "") + " " + item.get("snippet", ""), query): continue
+        ext = ".png" if link.lower().endswith(".png") else ".jpg"
+        try:
+            path = Path(str(path_base) + ext); download(link, path); used.add(link)
+        except Exception:
+            continue
+        credits.append(f"Image via Google Search - {item.get('image', {}).get('contextLink', link)}")
+        return path, "image"
+    return None
+
+
 AI_STYLE = ("cinematic 35mm film photograph, natural colours, soft realistic light, shallow depth of field, "
             "highly detailed, professional photography, no text, no captions, no logos, no watermark")
 _ai = {"last": 0.0, "fails": 0}
+GEMINI_IMAGE_MODELS = ["gemini-3.1-flash-image-preview", "gemini-3-pro-image-preview", "gemini-2.5-flash-image"]
+
+
+def gemini_image(prompt, path_base, style=""):
+    """Best-quality AI photo: Gemini's own native image model, correctly generated in 16:9 (no crop/stretch
+    distortion). PAID per image (roughly $0.04-$0.13 depending on model) - billed to the Google Cloud project
+    behind GEMINI_API_KEY, separate from that key's free text quota. Used only when no real photo was found."""
+    key = os.getenv("GEMINI_API_KEY", "").strip()
+    if not key or os.getenv("DISABLE_GEMINI_IMAGE", "").strip(): return None
+    full_prompt = f"{prompt}. {style or AI_STYLE}"[:900]
+    body = {"contents": [{"parts": [{"text": full_prompt}]}],
+            "generationConfig": {"responseModalities": ["IMAGE"], "imageConfig": {"aspectRatio": "16:9"}}}
+    for model in GEMINI_IMAGE_MODELS:
+        url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
+        try:
+            r = requests.post(url, headers={"x-goog-api-key": key}, json=body, timeout=120)
+        except requests.RequestException:
+            continue
+        if r.status_code != 200:
+            if r.status_code in (400, 403) and "billing" in r.text.lower(): return None   # no billing enabled: stop trying, fall through to free AI
+            continue
+        for part in r.json().get("candidates", [{}])[0].get("content", {}).get("parts", []):
+            inline = part.get("inlineData") or part.get("inline_data")
+            if inline and inline.get("data"):
+                import base64
+                data = base64.b64decode(inline["data"])
+                ext = ".png" if "png" in inline.get("mimeType", inline.get("mime_type", "")) else ".jpg"
+                path = Path(str(path_base) + ext); path.write_bytes(data)
+                return path, "image"
+    return None
 
 
 def ai_image(prompt, seed, path_base, style=""):
-    """AI picture for exactly this sentence (Pollinations; free without a key, faster with POLLINATIONS_API_KEY)."""
+    """AI picture for exactly this sentence: tries Gemini's native image model first (realistic, correct
+    16:9, but paid), then falls back to Pollinations (free, without a key ~15s/image, can look softer/wrong
+    aspect if it ignores the requested size)."""
+    got = gemini_image(prompt, path_base, style)
+    if got: return got
     key = os.getenv("POLLINATIONS_API_KEY", "").strip()
     wait = _ai["last"] + (5 if key else 16) - time.time()
     if wait > 0: time.sleep(wait)
@@ -368,7 +500,15 @@ def ai_image(prompt, seed, path_base, style=""):
         c = r.content
         ext = ".png" if c[:4] == b"\x89PNG" else ".jpg" if c[:2] == b"\xff\xd8" else None
         if r.status_code != 200 or not ext or len(c) < 20000: return None
-        path = Path(str(path_base) + ext); path.write_bytes(c)
+        path = Path(str(path_base) + ext)
+        path.write_bytes(c)
+        try:
+            w, h = (int(x) for x in subprocess.run(["ffprobe", "-v", "error", "-select_streams", "v:0",
+                    "-show_entries", "stream=width,height", "-of", "csv=s=x:p=0", str(path)],
+                    capture_output=True, text=True).stdout.strip().split("x"))
+            if w < 900 or abs(w / h - 16 / 9) > 0.35: return None   # too small or wrong aspect - Pollinations ignored our size hint
+        except Exception:
+            pass
         return path, "image"
     return None
 
@@ -385,46 +525,61 @@ def make_card(path, i):
 def stage_visuals(a, st):
     used, credits = set(), []
     st["credits"] = credits
-    have_pexels, mode, topic = bool(os.getenv("PEXELS_API_KEY", "").strip()), a.visuals, st.get("topic", "")
-    order = {"auto": ["ai", "wiki", "pvideo", "pphoto"], "ai": ["ai"], "real": ["wiki", "pvideo", "pphoto"]}[mode]
-    src_count = {}
+    mode, topic = a.visuals, st.get("topic", "")
+    have = lambda k: bool(os.getenv(k, "").strip())
+    order = {"auto": ["pixabay", "gcse", "pexels_photo", "pexels_video", "ai"],
+             "ai": ["ai"],
+             "real": ["pixabay", "gcse", "pexels_photo", "pexels_video"]}[mode]
+    src_count, total_imgs = {}, sum(len(s["prompts"]) for s in st["scenes"])
+    done = 0
     for s in st["scenes"]:
-        i, base, got, src = s["i"], Path(a.work) / f"vis_{s['i']:03d}", None, ""
-        queries = [q for q in dict.fromkeys([s["search_query"], keywords(s["narration"], 3)]) if q]
-        for step in ([] if a.offline else order):
-            try:
-                if step == "wiki":
-                    for q in queries:
-                        got = wikimedia(q, base, used, credits)
-                        if got: break
-                        time.sleep(0.3)
-                elif step in ("pvideo", "pphoto") and have_pexels:
-                    for q in queries:
-                        got = pexels(q, base, used, credits, step == "pvideo")
-                        if got: break
-                elif step == "ai" and _ai["fails"] < 3:
-                    got = ai_image(s["image_prompt"], 1000 + i, base, st.get("style", ""))
-                    _ai["fails"] = 0 if got else _ai["fails"] + 1
-                    if _ai["fails"] == 3: st["warnings"].append("AI image service failed 3 times in a row - switched it off for the rest of this video")
-            except Exception as e:
-                log(f"  visual lookup error ({step}): {str(e)[:100]}"); got = None
-            if got: src = step; break
-        if got: s["visual_file"], s["visual_kind"], s["source"], s["wm"] = got[0].name, got[1], src, (src == "ai")
-        else: s["visual_file"] = ""
-        src_count[src or "-"] = src_count.get(src or "-", 0) + 1
-        log(f"  {i + 1}/{len(st['scenes'])} [{src or 'none yet'}] {s['narration'][:60]}")
+        i, visuals = s["i"], []
+        for j, pr in enumerate(s["prompts"]):
+            base = Path(a.work) / f"vis_{i:03d}_{j}"
+            queries = [q for q in dict.fromkeys([pr["query"], keywords(pr["prompt"], 3)]) if q]
+            got, src = None, ""
+            for step in ([] if a.offline else order):
+                try:
+                    if step == "pixabay":
+                        for q in queries:
+                            got = pixabay(q, base, used, credits, False) or pixabay(q, base, used, credits, True)
+                            if got: break
+                    elif step == "gcse" and have("GOOGLE_CSE_KEY"):
+                        for q in queries:
+                            got = google_cse(q, base, used, credits)
+                            if got: break
+                    elif step == "pexels_photo" and have("PEXELS_API_KEY"):
+                        for q in queries:
+                            got = pexels(q, base, used, credits, False)
+                            if got: break
+                    elif step == "pexels_video" and have("PEXELS_API_KEY"):
+                        for q in queries:
+                            got = pexels(q, base, used, credits, True)
+                            if got: break
+                    elif step == "ai" and _ai["fails"] < 3:
+                        got = ai_image(pr["prompt"], 1000 + i * 7 + j, base, st.get("style", ""))
+                        _ai["fails"] = 0 if got else _ai["fails"] + 1
+                        if _ai["fails"] == 3: st["warnings"].append("AI image generation failed 3 times in a row - switched it off for the rest of this video")
+                except Exception as e:
+                    log(f"  visual lookup error ({step}): {str(e)[:100]}"); got = None
+                if got: src = step; break
+            if got: visuals.append(dict(file=got[0].name, kind=got[1], source=src, wm=(src == "ai")))
+            src_count[src or "-"] = src_count.get(src or "-", 0) + 1
+            done += 1
+        s["visuals"] = visuals
+        log(f"  {done}/{total_imgs} [{'+'.join(v['source'] for v in visuals) or 'none yet'}] {s['narration'][:55]}")
     # sentences with no picture reuse the nearest good one (different camera move) - never a random unrelated photo
-    good = [s for s in st["scenes"] if s["visual_file"]]
+    good = [v for s in st["scenes"] for v in s["visuals"]]
     for s in st["scenes"]:
-        if s["visual_file"]: continue
+        if s["visuals"]: continue
         if good:
-            ref = min(good, key=lambda g: (abs(g["i"] - s["i"]), g["i"] > s["i"]))
-            s["visual_file"], s["visual_kind"], s["source"], s["wm"] = ref["visual_file"], ref["visual_kind"], "reused", ref.get("wm", False)
+            ref = good[min(range(len(good)), key=lambda k: abs(st["scenes"].index(s) - k))]
+            s["visuals"] = [dict(ref, source="reused")]
         else:
-            s["visual_file"], s["visual_kind"], s["source"] = make_card(Path(a.work) / f"vis_{s['i']:03d}.png", s["i"]).name, "image", "card"
+            s["visuals"] = [dict(file=make_card(Path(a.work) / f"vis_{s['i']:03d}.png", s["i"]).name, kind="image", source="card", wm=False)]
         st["warnings"].append(f"Sentence {s['i'] + 1}: no matching picture found, reused a neighbouring one")
-    if any(s.get("source") == "ai" for s in st["scenes"]):
-        credits.append("Some images are AI-generated illustrations (Pollinations.ai). Tick 'altered or synthetic content' in YouTube Studio.")
+    if any(v["source"] == "ai" for s in st["scenes"] for v in s["visuals"]):
+        credits.append("Some images are AI-generated illustrations. Tick 'altered or synthetic content' in YouTube Studio.")
     log("Picture sources: " + ", ".join(f"{k}={v}" for k, v in src_count.items()))
 
 
@@ -455,7 +610,12 @@ def chunks_for(scene):
 
 ACCENT = "&H2FC7FF&"   # ASS colour (BGR): a warm gold/amber accent for highlighted words and stat cards
 
-ASS_HEAD = f"""[Script Info]
+
+def ass_head():
+    """Built fresh at render time (not a module-level constant) so it always matches the chosen
+    --resolution; baking W/H in at import time was a bug that mis-scaled subtitles on 720p renders."""
+    fsize, statsize = (56, 96) if H >= 1000 else (40, 68)
+    return f"""[Script Info]
 ScriptType: v4.00+
 PlayResX: {W}
 PlayResY: {H}
@@ -464,8 +624,8 @@ ScaledBorderAndShadow: yes
 
 [V4+ Styles]
 Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
-Style: Default,DejaVu Sans,56,&H00FFFFFF,&H000000FF,&H00000000,&H90000000,-1,0,0,0,100,100,0,0,1,4,2,2,140,140,85,1
-Style: Stat,DejaVu Sans,96,&H00FFFFFF,&H000000FF,&H00302000,&HD0201004,-1,0,0,0,100,100,0,0,3,0,10,5,80,80,60,1
+Style: Default,DejaVu Sans,{fsize},&H00FFFFFF,&H000000FF,&H00000000,&H90000000,-1,0,0,0,100,100,0,0,1,4,2,2,140,140,85,1
+Style: Stat,DejaVu Sans,{statsize},&H00FFFFFF,&H000000FF,&H00302000,&HD0201004,-1,0,0,0,100,100,0,0,3,0,10,5,80,80,60,1
 
 [Events]
 Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
@@ -501,7 +661,7 @@ def highlight(chunk_text):
 
 
 def write_ass(scene, path):
-    lines = [ASS_HEAD]
+    lines = [ass_head()]
     chunks = chunks_for(scene)
     for a, b, c in chunks:
         c = c.replace("{", "(").replace("}", ")")
@@ -533,35 +693,51 @@ def ensure_grain_tile(work):
 
 
 def render_segment(s, work, D, style, subs):
-    """Renders one sentence's clip. No per-segment fades or synthetic sound effects here - the whole
-    video is stitched together afterwards with real crossfade dissolves (see stage_render), and the
-    only audio is the clean narration (no ambient noise bed - that was the source of the 'noise' under
-    the voice in earlier versions)."""
-    i, kind = s["i"], s["visual_kind"]
+    """Renders one sentence's clip. Normally one image/clip for the whole sentence; if the sentence was
+    given several image keywords (comma-separated in the image-prompts box), it shows all of them in
+    sequence, sharing the sentence's screen time, with a quick internal dissolve between them. No
+    per-segment fades or synthetic sound effects here - the whole video is stitched together afterwards
+    with real crossfade dissolves (see stage_render), and the only audio is the clean narration (no
+    ambient noise bed - that was the source of the 'noise' under the voice in earlier versions)."""
+    i, visuals = s["i"], s["visuals"]
     seg = f"seg_{i:03d}.mkv"
     cmd = ["ffmpeg", "-y"]
-    cmd += ["-i", s["visual_file"]] if kind == "image" else ["-stream_loop", "-1", "-i", s["visual_file"]]
+    for v in visuals:
+        cmd += ["-i", v["file"]] if v["kind"] == "image" else ["-stream_loop", "-1", "-i", v["file"]]
+    voice_idx = len(visuals)
     cmd += ["-i", s["voice_file"]]
     grain_idx = None
     if style == "vintage":
-        cmd += ["-loop", "1", "-i", "grain_tile.png"]; grain_idx = 2
-    fc = []
-    if kind == "image":
-        N = int(D * FPS) + 2; z, x, y = motion(i, N)
-        pre = "crop=iw:ih*0.93:0:0," if (s.get("wm") and not os.getenv("POLLINATIONS_API_KEY", "").strip()) else ""
-        fc.append(f"[0:v]{pre}scale=2400:1350:force_original_aspect_ratio=increase,crop=2400:1350,setsar=1,"
-                  f"zoompan=z='{z}':x='{x}':y='{y}':d={N}:s={W}x{H}:fps={FPS}[v0]")
-    else:
-        fc.append(f"[0:v]scale={W}:{H}:force_original_aspect_ratio=increase,crop={W}:{H},setsar=1,fps={FPS}[v0]")
+        cmd += ["-loop", "1", "-i", "grain_tile.png"]; grain_idx = voice_idx + 1
+
+    n = len(visuals)
+    T = min(0.25, D / (n * 6)) if n > 1 else 0.0
+    dk = (D + (n - 1) * T) / n
+    fc, labels = [], []
+    for k, v in enumerate(visuals):
+        N = int(dk * FPS) + 2; z, x, y = motion(i * 7 + k, N)
+        if v["kind"] == "image":
+            pre = "crop=iw:ih*0.93:0:0," if (v.get("wm") and not os.getenv("POLLINATIONS_API_KEY", "").strip()) else ""
+            OW, OH = int(W * 1.25), int(H * 1.25)
+            fc.append(f"[{k}:v]{pre}scale={OW}:{OH}:force_original_aspect_ratio=increase,crop={OW}:{OH},setsar=1,"
+                      f"zoompan=z='{z}':x='{x}':y='{y}':d={N}:s={W}x{H}:fps={FPS}[c{k}]")
+        else:
+            fc.append(f"[{k}:v]scale={W}:{H}:force_original_aspect_ratio=increase,crop={W}:{H},setsar=1,fps={FPS},trim=duration={dk:.2f}[c{k}]")
+        labels.append(f"c{k}")
+    cur = labels[0]
+    for k in range(1, n):
+        nxt = f"vx{k}"
+        fc.append(f"[{cur}][{labels[k]}]xfade=transition=fade:duration={T:.3f}:offset={dk - T:.3f}[{nxt}]")
+        cur = nxt
     if style == "vintage":
-        fc.append("[v0]eq=contrast=1.06:saturation=0.88:brightness=-0.02,curves=r='0/0.03 1/0.98':b='0/0.05 1/0.88'[vg]")
+        fc.append(f"[{cur}]eq=contrast=1.06:saturation=0.88:brightness=-0.02,curves=r='0/0.03 1/0.98':b='0/0.05 1/0.88'[vg]")
         fc.append(f"[{grain_idx}:v]scale={W}:{H}:flags=neighbor[gr]")
         fc.append("[vg][gr]blend=all_mode=screen:all_opacity=0.045[vg2]")
         fc.append("[vg2]vignette=angle=PI/5[v1]")
     else:
-        fc.append("[v0]null[v1]")
+        fc.append(f"[{cur}]null[v1]")
     fc.append(f"[v1]ass=s_{i:03d}.ass[vout]" if subs else "[v1]null[vout]")
-    fc.append(f"[1:a]aresample=44100,aformat=channel_layouts=stereo,adelay={int(LEAD * 1000)}:all=1,apad=whole_dur={D:.2f}[aout]")
+    fc.append(f"[{voice_idx}:a]aresample=44100,aformat=channel_layouts=stereo,adelay={int(LEAD * 1000)}:all=1,apad=whole_dur={D:.2f}[aout]")
     cmd += ["-filter_complex", ";".join(fc), "-map", "[vout]", "-map", "[aout]", "-t", f"{D:.2f}",
             "-c:v", "libx264", "-preset", "veryfast", "-crf", "19", "-maxrate", "12M", "-bufsize", "24M",
             "-pix_fmt", "yuv420p", "-r", str(FPS),
@@ -570,32 +746,49 @@ def render_segment(s, work, D, style, subs):
     return seg
 
 
-def crossfade_merge(work, segs, durs, xfade_dur=0.35):
-    """Stitches the per-sentence clips into one stream with a real dissolve at every image change
-    (instead of a hard cut), so the change from one sentence's picture to the next is always visible."""
-    if len(segs) == 1:
-        return segs[0]
-    cmd = ["ffmpeg", "-y"]
-    for sgm in segs: cmd += ["-i", sgm]
-    vfc, afc, cur_v, cur_a, acc = [], [], "0:v", "0:a", durs[0]
-    for i in range(1, len(segs)):
-        T = max(0.08, min(xfade_dur, 0.4 * durs[i - 1], 0.4 * durs[i]))
-        vfc.append(f"[{cur_v}][{i}:v]xfade=transition=fade:duration={T:.3f}:offset={acc - T:.3f}[v{i}]")
-        afc.append(f"[{cur_a}][{i}:a]acrossfade=d={T:.3f}:c1=tri:c2=tri[a{i}]")
-        cur_v, cur_a, acc = f"v{i}", f"a{i}", acc + durs[i] - T
-    fc = vfc + afc
-    fc.append(f"[{cur_v}]fade=t=in:st=0:d=0.3,fade=t=out:st={acc - 0.3:.2f}:d=0.3[vout]")
-    out = "merged.mkv"
-    cmd += ["-filter_complex", ";".join(fc), "-map", "[vout]", "-map", f"[{cur_a}]",
-            "-c:v", "libx264", "-preset", "veryfast", "-crf", "19", "-maxrate", "12M", "-bufsize", "24M",
-            "-pix_fmt", "yuv420p", "-r", str(FPS), "-c:a", "pcm_s16le", out]
-    run(cmd, cwd=work)
-    return out
+def _xfade_pair(work, pair, xfade_dur, tag):
+    """Merges exactly 2 clips with a crossfade dissolve. Only 2 inputs open at once, so this
+    is safe at any scene count - the crash on a 220-scene video was GitHub's runner running
+    out of memory from opening all 220 clips in a single ffmpeg process at once."""
+    (pa, da), (pb, db) = pair
+    T = max(0.08, min(xfade_dur, 0.4 * da, 0.4 * db))
+    out = f"xf_{tag}.mkv"
+    fc = (f"[0:v][1:v]xfade=transition=fade:duration={T:.3f}:offset={da - T:.3f}[vout];"
+          f"[0:a][1:a]acrossfade=d={T:.3f}:c1=tri:c2=tri[aout]")
+    run(["ffmpeg", "-y", "-i", pa, "-i", pb, "-filter_complex", fc, "-map", "[vout]", "-map", "[aout]",
+         "-c:v", "libx264", "-preset", "veryfast", "-crf", "19", "-maxrate", "12M", "-bufsize", "24M",
+         "-pix_fmt", "yuv420p", "-r", str(FPS), "-c:a", "pcm_s16le", out], cwd=work)
+    return out, da + db - T
+
+
+def crossfade_merge(work, segs, durs, xfade_dur=0.35, workers=None):
+    """Stitches every sentence's clip into one stream with a real dissolve at each image change,
+    merging in memory-safe pairs (binary-tree rounds) instead of opening every clip at once."""
+    items = list(zip(segs, durs))
+    if not items: raise SystemExit("No rendered scenes to stitch together")
+    workers = workers or max(1, min(3, (os.cpu_count() or 1) // 2 or 1))
+    round_no = 0
+    while len(items) > 1:
+        round_no += 1
+        pairs = [items[i:i + 2] for i in range(0, len(items), 2)]
+        def job(args):
+            idx, pr = args
+            if len(pr) == 1: return pr[0]
+            return _xfade_pair(work, pr, xfade_dur, f"r{round_no}_{idx}")
+        with ThreadPoolExecutor(workers) as ex:
+            items = list(ex.map(job, enumerate(pairs)))
+        log(f"  crossfade round {round_no}: {len(items)} clip(s) remaining")
+    out_name, total_dur = items[0]
+    final = "merged.mkv"
+    run(["ffmpeg", "-y", "-i", out_name, "-vf", f"fade=t=in:st=0:d=0.3,fade=t=out:st={max(0, total_dur - 0.3):.2f}:d=0.3",
+         "-af", f"afade=t=in:d=0.3,afade=t=out:st={max(0, total_dur - 0.3):.2f}:d=0.3",
+         "-c:v", "libx264", "-preset", "veryfast", "-crf", "19", "-maxrate", "12M", "-bufsize", "24M",
+         "-pix_fmt", "yuv420p", "-r", str(FPS), "-c:a", "pcm_s16le", final], cwd=work)
+    return final
 
 
 def stage_render(a, st):
     work, out = Path(a.work), Path(a.out); out.mkdir(parents=True, exist_ok=True)
-    from concurrent.futures import ThreadPoolExecutor
     total = len(st["scenes"])
     for s in st["scenes"]:
         s["dur"] = max(2.0, s["voice_dur"] + LEAD + TAIL)
@@ -652,7 +845,10 @@ def stage_metadata(a, st):
             'covers, ending with a subscribe line. Plain text, no markdown.>","hashtags":["#tag", ...8 to 12 short hashtags...],'
             '"keywords":["keyword phrase", ...12 to 18 SEO search phrases a viewer might type, comma-style, no # symbol...]}\n'
             "Rules: titles must be honest to the content (no clickbait that misleads), no ALL CAPS, no emoji spam (max 1 emoji "
-            "per title). Topic: " + (st.get("topic") or "see narration below") + "\n\nNARRATION:\n" + script[:6000])
+            "per title). Topic: " + (st.get("topic") or "see narration below") + "\n\nNARRATION:\n" + script[:6000] +
+            '\n\nAlso include "thumbnail_prompt": one vivid sentence (25-40 words) describing an outstanding, '
+            'photorealistic, HD YouTube-thumbnail image for this video - a single striking hero shot, dramatic '
+            'light, sharp focus, no text/logos/watermarks, nothing generic or stock-looking.')
         body = {"contents": [{"parts": [{"text": prompt}]}], "generationConfig": {"responseMimeType": "application/json", "temperature": 0.7}}
         try:
             data = json.loads(gemini_call(body, key))
@@ -663,16 +859,30 @@ def stage_metadata(a, st):
         base = (st.get("topic") or "This Video").strip()
         data = {"titles": [f"{base} - The Full Story", f"What You Didn't Know About {base}", f"{base}: Explained"],
                 "description": f"A closer look at {base.lower()}. Subscribe for more.",
-                "hashtags": ["#shorts" if False else "#video", "#documentary", "#explainer"],
-                "keywords": [base.lower()] if base else []}
+                "hashtags": ["#video", "#documentary", "#explainer"],
+                "keywords": [base.lower()] if base else [],
+                "thumbnail_prompt": f"A striking, photorealistic HD hero shot representing {base.lower()}, dramatic light, sharp focus"}
     lines = ["=== TITLES (pick one) ===", ""]
     lines += [f"{i + 1}. {t}" for i, t in enumerate(data.get("titles", []))]
     lines += ["", "=== DESCRIPTION ===", "", data.get("description", ""),
               "", "=== HASHTAGS ===", "", " ".join(data.get("hashtags", [])),
-              "", "=== SEO KEYWORDS (comma-separated, paste into YouTube 'Tags') ===", "", ", ".join(data.get("keywords", []))]
+              "", "=== SEO KEYWORDS (comma-separated, paste into YouTube 'Tags') ===", "", ", ".join(data.get("keywords", [])),
+              "", "=== THUMBNAIL IMAGE PROMPT (also used to render thumbnail.jpg) ===", "", data.get("thumbnail_prompt", "")]
     (out / "youtube_metadata.txt").write_text("\n".join(lines), encoding="utf-8")
     (out / "youtube_metadata.json").write_text(json.dumps(data, indent=1, ensure_ascii=False), encoding="utf-8")
     log("Wrote youtube_metadata.txt")
+    if data.get("thumbnail_prompt") and not a.offline:
+        try:
+            got = ai_image(data["thumbnail_prompt"], 9001, out / "thumbnail", st.get("style", ""))
+            if got:
+                run(["ffmpeg", "-y", "-i", got[0].name, "-vf", "scale=1280:720:force_original_aspect_ratio=increase,crop=1280:720",
+                     "thumbnail.jpg"], cwd=out)
+                if got[0].name != "thumbnail.jpg": (out / got[0].name).unlink(missing_ok=True)
+                log("Wrote thumbnail.jpg")
+            else:
+                st["warnings"].append("Could not generate a thumbnail image automatically - use the thumbnail prompt above yourself")
+        except Exception as e:
+            st["warnings"].append(f"Thumbnail image generation failed: {str(e)[:120]}")
 
 
 # ----------------------------------------------------------------- MAIN
@@ -680,16 +890,19 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--stage", default="all", choices=["all", "plan", "voice", "visuals", "render", "metadata"])
     ap.add_argument("--script", default="work/script.txt"); ap.add_argument("--work", default="work"); ap.add_argument("--out", default="out")
-    ap.add_argument("--voice", default="en-GB-RyanNeural"); ap.add_argument("--voice-engine", default="auto", choices=["auto", "edge", "eleven"])
+    ap.add_argument("--voice", default="en-GB-RyanNeural"); ap.add_argument("--voice-engine", default="auto", choices=["auto", "edge", "eleven", "gemini"])
     ap.add_argument("--style", default="vintage", choices=["vintage", "clean"])
     ap.add_argument("--visuals", default="auto", choices=["auto", "ai", "real"], help="auto: verified real photo else AI; ai: AI image for every sentence; real: photos only")
     ap.add_argument("--subtitles", default="true"); ap.add_argument("--max-scenes", type=int, default=0)
+    ap.add_argument("--resolution", default="1080p", choices=["1080p", "720p"])
     ap.add_argument("--offline", action="store_true", help="no network: title cards + silent voice (for testing)")
     a = ap.parse_args(); a.subtitles = str(a.subtitles).lower() in ("1", "true", "yes", "on")
+    global W, H
+    if a.resolution == "720p": W, H = 1280, 720
     Path(a.work).mkdir(parents=True, exist_ok=True)
     sp = Path(a.work) / "state.json"
     st = json.loads(sp.read_text()) if sp.exists() else {"scenes": [], "warnings": [], "credits": []}
-    stages = {"plan": stage_plan, "voice": stage_voice, "visuals": stage_visuals, "render": stage_render, "metadata": stage_metadata}
+    stages = {"plan": stage_plan, "metadata": stage_metadata, "voice": stage_voice, "visuals": stage_visuals, "render": stage_render}
     for name in (stages if a.stage == "all" else [a.stage]):
         log(f"== {name} =="); t = time.time()
         if name not in ("plan",) and not st["scenes"]: raise SystemExit("Run the plan stage first")

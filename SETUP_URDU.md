@@ -22,6 +22,52 @@ Script sentence-by-sentence toot-ti hai. Har sentence ki apni image hoti hai jo 
 App me 3 modes: **Auto** (asli photo tab jab wo sentence se sach me match kare, warna AI image), **AI har sentence ke liye**, **Real photos only**.
 **GEMINI_API_KEY zaroor daalo** (free): wo har sentence ke liye sahi search words aur image description likhta hai, is se matching bohat behtar hoti hai.
 
+## V12: Crash fix, real HD images, kayi images per sentence, Gemini voice, 720p/1080p
+
+**1) 220-scene wali video crash (exit 143) theek ho gayi.** Wajah: itni saari clips ek sath joinne ki
+koshish me GitHub ka server memory khatam kar deta tha. Ab clips 2-2 karke jode jate hain (tree ki tarah),
+kitni bhi scenes hon, crash nahi hoga.
+
+**2) AI images ab HD aur realistic hain.** Pehle sirf free Pollinations istemal hoti thi jo kabhi 9:16 bana
+kar 16:9 me zabardasti fit karti thi, is liye pixel phat jate thay. Ab AI image ki pehli koshish **Gemini ka apna
+image model** hai jo sahi 16:9 banata hai (koi stretch nahi) — magar ye **paid** hai (~$0.04-$0.13 per image,
+aapke GEMINI_API_KEY wale Google Cloud project par billing on honi chahiye). Billing on na ho to khud
+Pollinations (free) par wapas chala jata hai, magar ab glat-aspect wali image ko check kar ke reject kar diya
+jata hai (dobara koshish ya reuse/card), kabhi stretched image lagti hi nahi.
+
+**3) "1 sentence = 1 image" ka rule khatam.** Image-prompts box me ab:
+- Ek line = ek sentence.
+- Us line me comma se 2-3 keywords do to utni hi images us ek sentence ke dauran dikhengi (misal: `Jaguar
+  speedometer, Jaguar motorway, Jaguar rear view` → 3 images, 1 sentence).
+- Agar line me "Google image search keywords:" jaisa koi label likha ho, wo khud hat jata hai, sirf asli
+  keywords istemal hotay hain.
+
+**4) Image sources badal di hain.** Wikipedia ab istemal nahi hoti. Ab **Pixabay** (free, key chahiye) aur
+**Pexels** pehli koshish hain. **Pinterest** ko shamil nahi kiya — uska koi official/legal search API nahi
+hai, scraping unki policy ke khilaf hai aur bohat jald block ho jati. **Google Images** ka bhi free/legal
+search API nahi hai, magar Google ka official **Custom Search API** (`GOOGLE_CSE_KEY` + `GOOGLE_CSE_ID`
+secrets) optional add kar sakte ho — free 100 searches/day, uske baad paid.
+
+**5) Gemini AI voice add hui.** Voice dropdown me "Gemini AI narrator" option hai — agar ElevenLabs na ho to
+ye istemal hoti hai (free Edge-TTS se pehle). Default voice "Charon" hai (gehri, saaf, dastaan-go andaaz, 60+
+British audience ke liye munasib). Chahen to `GEMINI_TTS_VOICE` secret me koi aur Google AI Studio ka voice
+naam daal kar badal sakte ho. Priority: ElevenLabs → Gemini → free Edge-TTS.
+
+**6) 720p/1080p dono available hain.** App me naya dropdown hai, jo chuno wohi output banega.
+
+**7) Pehle title/description, phir video.** Ab workflow ka step 2 hi "titles, description, hashtags,
+thumbnail" banata hai — video render hone se pehle. Render me zyada waqt lagta hai, is liye SEO pack jald mil
+jata hai.
+
+**8) Thumbnail bhi khud ban jati hai.** `thumbnail.jpg` (1280x720, realistic HD) ab video ke sath Pictures
+folder me save hoti hai, aur `youtube_metadata.txt` me uska prompt bhi likha hota hai.
+
+**Naye optional secrets (sab GitHub → Settings → Secrets and variables → Actions me):**
+- `PIXABAY_API_KEY` — free, pixabay.com/api/docs se banta hai. **Strongly recommend**, ab ye asli photo ka
+  pehla source hai.
+- `GOOGLE_CSE_KEY` + `GOOGLE_CSE_ID` — optional, Google Custom Search (100/day free).
+- `GEMINI_TTS_VOICE` — optional, Gemini voice ka naam badalne ke liye.
+
 ## V11: Kinetic captions + number/fact stat-cards
 Subtitles ab simple safed text nahi, **kinetic style** hain: har phrase halka sa 'pop' karke aata hai, aur us phrase ka khaas lafz (number ya khaas naam) sunehri rang me highlight hota hai.
 

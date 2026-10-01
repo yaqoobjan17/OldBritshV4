@@ -52,15 +52,18 @@ public class MainActivity extends Activity {
     static final int GREEN = Color.rgb(27, 94, 32);
 
     static final String[] VOICE_LABELS = {
-            "Auto (ElevenLabs if set, else British male)",
-            "British male - Ryan", "British male - Thomas", "British female - Sonia"};
+            "Auto (best available: ElevenLabs, then Gemini, then British male)",
+            "British male - Ryan (free)", "British male - Thomas (free)", "British female - Sonia (free)",
+            "Gemini AI narrator (Google AI Studio)"};
     static final String[] VIS_LABELS = {
             "Images: Auto (matching real photo, else AI)",
             "Images: AI picture for every sentence",
             "Images: Real photos only"};
     static final String[] VIS_VALUE = {"auto", "ai", "real"};
-    static final String[] VOICE_ENGINE = {"auto", "edge", "edge", "edge"};
-    static final String[] VOICE_NAME = {"en-GB-RyanNeural", "en-GB-RyanNeural", "en-GB-ThomasNeural", "en-GB-SoniaNeural"};
+    static final String[] VOICE_ENGINE = {"auto", "edge", "edge", "edge", "gemini"};
+    static final String[] VOICE_NAME = {"en-GB-RyanNeural", "en-GB-RyanNeural", "en-GB-ThomasNeural", "en-GB-SoniaNeural", "en-GB-RyanNeural"};
+    static final String[] RES_LABELS = {"1080p (Full HD)", "720p (smaller file, faster render)"};
+    static final String[] RES_VALUE = {"1080p", "720p"};
 
     SharedPreferences prefs;
     EditText script, imagePrompts, repoEt, tokenEt;
@@ -68,7 +71,7 @@ public class MainActivity extends Activity {
     ProgressBar bar;
     Button create, openBtn, copyBtn;
     CheckBox subsCb, vintageCb;
-    Spinner voiceSp, visSp;
+    Spinner voiceSp, visSp, resSp;
     LinearLayout setupBox;
     volatile boolean busy = false;
     Uri savedUri;
@@ -161,10 +164,13 @@ public class MainActivity extends Activity {
         script.setTextSize(16);
         r.addView(script, new LinearLayout.LayoutParams(-1, -2));
 
-        r.addView(tv("Optional: one image prompt per line, same order and count as the sentences above. "
-                + "Leave empty to let AI choose automatically.", 12, Color.DKGRAY));
+        r.addView(tv("Optional: one line per sentence, same order as above. One line = one image for that "
+                + "sentence; put 2-3 keywords separated by commas on a line to show that many images during that "
+                + "one sentence. Any label text before a colon (e.g. 'Google image keywords:') is ignored "
+                + "automatically. Real photos come from Pixabay/Pexels (never Wikipedia); AI is only used when no "
+                + "real photo matches. Leave this box empty to let AI choose automatically.", 12, Color.DKGRAY));
         imagePrompts = new EditText(this);
-        imagePrompts.setHint("Sentence 1 image prompt/keywords\nSentence 2 image prompt/keywords\n...");
+        imagePrompts.setHint("Sentence 1: keyword\nSentence 2: keywordA, keywordB, keywordC (3 images for this one sentence)\n...");
         imagePrompts.setGravity(Gravity.TOP);
         imagePrompts.setMinLines(4);
         imagePrompts.setTextSize(14);
@@ -184,6 +190,10 @@ public class MainActivity extends Activity {
         voiceSp = new Spinner(this);
         voiceSp.setAdapter(new ArrayAdapter<>(this, android.R.layout.simple_spinner_dropdown_item, VOICE_LABELS));
         r.addView(voiceSp);
+
+        resSp = new Spinner(this);
+        resSp.setAdapter(new ArrayAdapter<>(this, android.R.layout.simple_spinner_dropdown_item, RES_LABELS));
+        r.addView(resSp);
 
         visSp = new Spinner(this);
         visSp.setAdapter(new ArrayAdapter<>(this, android.R.layout.simple_spinner_dropdown_item, VIS_LABELS));
@@ -275,6 +285,7 @@ public class MainActivity extends Activity {
         try {
             in = new JSONObject().put("voice_engine", VOICE_ENGINE[v]).put("voice", VOICE_NAME[v])
                     .put("visuals", VIS_VALUE[visSp.getSelectedItemPosition()])
+                    .put("resolution", RES_VALUE[resSp.getSelectedItemPosition()])
                     .put("style", vintageCb.isChecked() ? "vintage" : "clean").put("subtitles", subsCb.isChecked() ? "true" : "false")
                     .put("script", s).put("image_prompts", imagePrompts.getText().toString().trim());
         } catch (Exception e) {
@@ -344,16 +355,26 @@ public class MainActivity extends Activity {
             // 3) download the finished MP4 (+ credits)
             setStatus("Downloading your video...", 92);
             JSONObject rel = new JSONObject(gh("GET", "/repos/" + repo + "/releases/tags/video-" + jobId, null));
-            String videoUrl = null, credUrl = null, metaUrl = null;
+            String videoUrl = null, credUrl = null, metaUrl = null, thumbUrl = null;
             JSONArray assets = rel.getJSONArray("assets");
             for (int i = 0; i < assets.length(); i++) {
                 JSONObject a = assets.getJSONObject(i);
                 if ("final.mp4".equals(a.getString("name"))) videoUrl = a.getString("url");
                 if ("credits.txt".equals(a.getString("name"))) credUrl = a.getString("url");
                 if ("youtube_metadata.txt".equals(a.getString("name"))) metaUrl = a.getString("url");
+                if ("thumbnail.jpg".equals(a.getString("name"))) thumbUrl = a.getString("url");
             }
             if (videoUrl == null) throw new IllegalStateException("Finished, but final.mp4 was not found in the release.");
             String where = saveVideo("OldBritishCars_" + jobId + ".mp4", videoUrl);
+            if (thumbUrl != null) {
+                try {
+                    ByteArrayOutputStream bo = new ByteArrayOutputStream();
+                    download(thumbUrl, bo, 0);
+                    saveImageToMovies("OldBritishCars_" + jobId + "_thumbnail.jpg", bo.toByteArray());
+                } catch (Exception ignore) {
+                    // thumbnail is optional
+                }
+            }
             String extra = "";
             if (metaUrl != null) {
                 try {
@@ -437,6 +458,23 @@ public class MainActivity extends Activity {
             download(assetUrl, o, 92);
         }
         return f.getAbsolutePath();
+    }
+
+    void saveImageToMovies(String name, byte[] data) throws Exception {
+        if (Build.VERSION.SDK_INT >= 29) {
+            ContentValues cv = new ContentValues();
+            cv.put(MediaStore.Images.Media.DISPLAY_NAME, name);
+            cv.put(MediaStore.Images.Media.MIME_TYPE, "image/jpeg");
+            cv.put(MediaStore.Images.Media.RELATIVE_PATH, Environment.DIRECTORY_PICTURES + "/OldBritishCars");
+            Uri uri = getContentResolver().insert(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, cv);
+            if (uri == null) return;
+            try (OutputStream o = getContentResolver().openOutputStream(uri)) { o.write(data); }
+            return;
+        }
+        File dir = getExternalFilesDir(Environment.DIRECTORY_PICTURES);
+        if (dir == null) return;
+        dir.mkdirs();
+        try (FileOutputStream o = new FileOutputStream(new File(dir, name))) { o.write(data); }
     }
 
     // ------------------------------------------------------------------ HTTP
